@@ -1,0 +1,32 @@
+filters:
+  ".*":
+    reviewers:
+      - xiaofan-luan
+      - liliu-z
+      - Presburger
+      - foxspy
+      - hhy3
+      - PwzXxm
+      - cqy123456
+      - zhengbuqian
+      - chasingegg
+      - alexanderguzhva
+
+    approvers:
+      - xiaofan-luan
+      - liliu-z
+      - Presburger
+      - foxspy
+      - hhy3
+      - PwzXxm
+      - cqy123456
+      - zhengbuqian
+      - chasingegg
+      - alexanderguzhva
+
+  "tests":
+    reviewers:
+      - yanliang567
+
+    approvers:
+      - yanliang567

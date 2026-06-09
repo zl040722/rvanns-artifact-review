@@ -1,0 +1,21 @@
+name: 'Knowhere Cache'
+description: ''
+inputs:
+  os:
+    description: 'OS name'
+    required: true
+    default: 'ubuntu22.04'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Cache CCache Volumes
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.cache/ccache
+        key: knowhere-${{ inputs.os }}-${{ github.job }}-ccache-${{ hashFiles( '**/*.cpp', '**/*.cc', '**/*.c', '**/*.h', '**/*.hpp', '**/CMakeLists.txt') }}
+    - name: Cache Conan Packages
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.conan
+        key: knowhere-${{ inputs.os }}-${{ github.job }}-conan-${{ hashFiles('conanfile.py') }}

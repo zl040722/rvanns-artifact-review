@@ -1,0 +1,674 @@
+// Copyright (C) 2019-2023 Zilliz. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied. See the License for the specific language governing permissions and limitations under the License.
+
+#include <sys/mman.h>
+
+#include <exception>
+
+#include "index/sparse/sparse_inverted_index.h"
+#include "index/sparse/sparse_inverted_index_config.h"
+#include "io/file_io.h"
+#include "io/memory_io.h"
+#include "knowhere/comp/index_param.h"
+#include "knowhere/config.h"
+#include "knowhere/dataset.h"
+#include "knowhere/expected.h"
+#include "knowhere/index/index_factory.h"
+#include "knowhere/index/index_node.h"
+#include "knowhere/log.h"
+#include "knowhere/operands.h"
+#include "knowhere/sparse_utils.h"
+#include "knowhere/thread_pool.h"
+#include "knowhere/utils.h"
+
+namespace knowhere {
+
+// Inverted Index impl for sparse vectors.
+//
+// Not overriding RangeSearch, will use the default implementation in IndexNode.
+//
+// Thread safety: not thread safe.
+template <typename T, bool use_wand>
+class SparseInvertedIndexNode : public IndexNode {
+    static_assert(std::is_same_v<T, knowhere::sparse_u32_f32>, "SparseInvertedIndexNode only support sparse_u32_f32");
+    using value_type = typename T::ValueType;
+
+ public:
+    explicit SparseInvertedIndexNode(const int32_t& version, const Object& /*object*/)
+        : search_pool_(ThreadPool::GetGlobalSearchThreadPool()),
+          build_pool_(ThreadPool::GetGlobalBuildThreadPool()),
+          index_version_(version) {
+    }
+
+    ~SparseInvertedIndexNode() override {
+        DeleteExistingIndex();
+    }
+
+    Status
+    Train(const DataSetPtr dataset, std::shared_ptr<Config> config, bool use_knowhere_build_pool) override {
+        auto cfg = static_cast<const SparseInvertedIndexConfig&>(*config);
+        if (!IsMetricType(cfg.metric_type.value(), metric::IP) &&
+            !IsMetricType(cfg.metric_type.value(), metric::BM25)) {
+            LOG_KNOWHERE_ERROR_ << Type() << " only support metric_type IP or BM25";
+            return Status::invalid_metric_type;
+        }
+        auto index_or = CreateIndex</*mmapped=*/false>(cfg);
+        if (!index_or.has_value()) {
+            return index_or.error();
+        }
+        auto index = index_or.value();
+        index->Train(static_cast<const sparse::SparseRow<value_type>*>(dataset->GetTensor()), dataset->GetRows());
+        if (index_ != nullptr) {
+            LOG_KNOWHERE_WARNING_ << Type() << " has already been created, deleting old";
+            DeleteExistingIndex();
+        }
+        index_ = index;
+        return Status::success;
+    }
+
+    Status
+    Add(const DataSetPtr dataset, std::shared_ptr<Config> config, bool use_knowhere_build_pool) override {
+        if (!index_) {
+            LOG_KNOWHERE_ERROR_ << "Could not add data to empty " << Type();
+            return Status::empty_index;
+        }
+        auto build_pool_wrapper = std::make_shared<ThreadPoolWrapper>(build_pool_, use_knowhere_build_pool);
+        auto tryObj =
+            build_pool_wrapper
+                ->push([&] {
+                    return index_->Add(static_cast<const sparse::SparseRow<value_type>*>(dataset->GetTensor()),
+                                       dataset->GetRows(), dataset->GetDim());
+                })
+                .getTry();
+        if (!tryObj.hasValue()) {
+            LOG_KNOWHERE_WARNING_ << "failed to add data to index " << Type() << ": " << tryObj.exception().what();
+            return Status::sparse_inner_error;
+        }
+        return tryObj.value();
+    }
+
+    [[nodiscard]] expected<DataSetPtr>
+    Search(const DataSetPtr dataset, std::unique_ptr<Config> config, const BitsetView& bitset,
+           milvus::OpContext* op_context) const override {
+        if (!index_) {
+            LOG_KNOWHERE_ERROR_ << "Could not search empty " << Type();
+            return expected<DataSetPtr>::Err(Status::empty_index, "index not loaded");
+        }
+
+        auto cfg = static_cast<const SparseInvertedIndexConfig&>(*config);
+
+        auto computer_or = index_->GetDocValueComputer(cfg);
+        if (!computer_or.has_value()) {
+            return expected<DataSetPtr>::Err(computer_or.error(), computer_or.what());
+        }
+        auto computer = computer_or.value();
+        auto dim_max_score_ratio = cfg.dim_max_score_ratio.value();
+        auto drop_ratio_search = cfg.drop_ratio_search.value_or(0.0f);
+        auto refine_factor = cfg.refine_factor.value_or(1);
+        // if no data was dropped during search, no refinement is needed.
+        if (drop_ratio_search == 0) {
+            refine_factor = 1;
+        }
+
+        sparse::InvertedIndexApproxSearchParams approx_params = {
+            .refine_factor = refine_factor,
+            .drop_ratio_search = drop_ratio_search,
+            .dim_max_score_ratio = dim_max_score_ratio,
+        };
+
+        auto queries = static_cast<const sparse::SparseRow<value_type>*>(dataset->GetTensor());
+        auto nq = dataset->GetRows();
+        auto k = cfg.k.value();
+        auto p_id = std::make_unique<sparse::label_t[]>(nq * k);
+        auto p_dist = std::make_unique<float[]>(nq * k);
+
+        std::vector<folly::Future<folly::Unit>> futs;
+        futs.reserve(nq);
+        for (int64_t idx = 0; idx < nq; ++idx) {
+            futs.emplace_back(search_pool_->push([&, idx = idx, p_id = p_id.get(), p_dist = p_dist.get()]() {
+                index_->Search(queries[idx], k, p_dist + idx * k, p_id + idx * k, bitset, computer, approx_params);
+            }));
+        }
+        WaitAllSuccess(futs);
+        return GenResultDataSet(nq, k, p_id.release(), p_dist.release());
+    }
+
+ private:
+    class RefineIterator : public IndexIterator {
+     public:
+        RefineIterator(const sparse::BaseInvertedIndex<value_type>* index, sparse::SparseRow<value_type>&& query,
+                       std::shared_ptr<PrecomputedDistanceIterator> precomputed_it,
+                       const sparse::DocValueComputer<float>& computer, bool use_knowhere_search_pool = true,
+                       const float refine_ratio = 0.5f)
+            : IndexIterator(true, use_knowhere_search_pool, refine_ratio),
+              index_(index),
+              query_(std::move(query)),
+              computer_(computer),
+              precomputed_it_(precomputed_it) {
+        }
+
+     protected:
+        // returns n_rows / 10 DistId for the first time to create a large enough window for refinement.
+        void
+        next_batch(std::function<void(const std::vector<DistId>&)> batch_handler) override {
+            std::vector<DistId> dists;
+            size_t num = first_return_ ? (std::max(index_->n_rows() / 10, static_cast<size_t>(20))) : 1;
+            first_return_ = false;
+            for (size_t i = 0; i < num && precomputed_it_->HasNext(); ++i) {
+                auto [id, dist] = precomputed_it_->Next();
+                dists.emplace_back(id, dist);
+            }
+            batch_handler(dists);
+        }
+
+        float
+        raw_distance(int64_t id) override {
+            return index_->GetRawDistance(id, query_, computer_);
+        }
+
+     private:
+        const sparse::BaseInvertedIndex<value_type>* index_;
+        sparse::SparseRow<value_type> query_;
+        const sparse::DocValueComputer<float> computer_;
+        std::shared_ptr<PrecomputedDistanceIterator> precomputed_it_;
+        bool first_return_ = true;
+    };
+
+ public:
+    // TODO: for now inverted index and wand use the same impl for AnnIterator.
+    [[nodiscard]] expected<std::vector<IndexNode::IteratorPtr>>
+    AnnIterator(const DataSetPtr dataset, std::unique_ptr<Config> config, const BitsetView& bitset,
+                bool use_knowhere_search_pool, milvus::OpContext* op_context) const override {
+        if (!index_) {
+            LOG_KNOWHERE_WARNING_ << "creating iterator on empty index";
+            return expected<std::vector<std::shared_ptr<IndexNode::iterator>>>::Err(Status::empty_index,
+                                                                                    "index not loaded");
+        }
+        auto nq = dataset->GetRows();
+        auto queries = static_cast<const sparse::SparseRow<value_type>*>(dataset->GetTensor());
+
+        auto cfg = static_cast<const SparseInvertedIndexConfig&>(*config);
+        auto computer_or = index_->GetDocValueComputer(cfg);
+        if (!computer_or.has_value()) {
+            return expected<std::vector<std::shared_ptr<IndexNode::iterator>>>::Err(computer_or.error(),
+                                                                                    computer_or.what());
+        }
+        auto computer = computer_or.value();
+        auto drop_ratio_search = cfg.drop_ratio_search.value_or(0.0f);
+
+        // TODO: set approximated to false for now since the refinement is too slow after forward index is removed.
+        const bool approximated = false;
+
+        auto vec = std::vector<std::shared_ptr<IndexNode::iterator>>(nq, nullptr);
+        try {
+            for (int i = 0; i < nq; ++i) {
+                // Heavy computations with `compute_dist_func` will be deferred until the first call to
+                // 'Iterator->Next()'.
+                auto compute_dist_func = [=]() -> std::vector<DistId> {
+                    auto queries = static_cast<const sparse::SparseRow<value_type>*>(dataset->GetTensor());
+                    std::vector<float> distances =
+                        index_->GetAllDistances(queries[i], drop_ratio_search, bitset, computer);
+                    std::vector<DistId> distances_ids;
+                    // 30% is a ratio guesstimate of non-zero distances: probability of 2 random sparse splade
+                    // vectors(100 non zero dims out of 30000 total dims) sharing at least 1 common non-zero
+                    // dimension.
+                    distances_ids.reserve(distances.size() * 0.3);
+                    for (size_t i = 0; i < distances.size(); i++) {
+                        if (distances[i] != 0) {
+                            distances_ids.emplace_back((int64_t)i, distances[i]);
+                        }
+                    }
+                    return distances_ids;
+                };
+                if (!approximated || queries[i].size() == 0) {
+                    auto it = std::make_shared<PrecomputedDistanceIterator>(compute_dist_func, true,
+                                                                            use_knowhere_search_pool);
+                    vec[i] = it;
+                } else {
+                    sparse::SparseRow<value_type> query_copy(queries[i]);
+                    auto it = std::make_shared<PrecomputedDistanceIterator>(compute_dist_func, true, false);
+                    vec[i] = std::make_shared<RefineIterator>(index_, std::move(query_copy), it, computer,
+                                                              use_knowhere_search_pool);
+                }
+            }
+        } catch (const std::exception& e) {
+            return expected<std::vector<IndexNode::IteratorPtr>>::Err(Status::sparse_inner_error, e.what());
+        }
+
+        return vec;
+    }
+
+    [[nodiscard]] expected<DataSetPtr>
+    GetVectorByIds(const DataSetPtr dataset, milvus::OpContext* op_context) const override {
+        return expected<DataSetPtr>::Err(Status::not_implemented, "GetVectorByIds not implemented");
+    }
+
+    static bool
+    StaticHasRawData(const knowhere::BaseConfig& /*config*/, const IndexVersion& /*version*/) {
+        return false;
+    }
+
+    [[nodiscard]] bool
+    HasRawData(const std::string& metric_type) const override {
+        return false;
+    }
+
+    [[nodiscard]] expected<DataSetPtr>
+    GetIndexMeta(std::unique_ptr<Config> cfg) const override {
+        return expected<DataSetPtr>::Err(Status::not_implemented, "GetIndexMeta not supported for current index type");
+    }
+
+    Status
+    Serialize(BinarySet& binset) const override {
+        if (!index_) {
+            LOG_KNOWHERE_ERROR_ << "Could not serialize empty " << Type();
+            return Status::empty_index;
+        }
+        MemoryIOWriter writer;
+        if (version_use_raw_data()) {
+            RETURN_IF_ERROR(index_->SerializeV0(writer));
+        } else {
+            RETURN_IF_ERROR(index_->Serialize(writer));
+        }
+        std::shared_ptr<uint8_t[]> data(writer.data());
+        binset.Append(Type(), data, writer.tellg());
+        return Status::success;
+    }
+
+    Status
+    Deserialize(const BinarySet& binset, std::shared_ptr<Config> config) override {
+        if (index_ != nullptr) {
+            LOG_KNOWHERE_WARNING_ << Type() << " has already been created, deleting old";
+            DeleteExistingIndex();
+        }
+        auto cfg = static_cast<const knowhere::SparseInvertedIndexConfig&>(*config);
+        auto binary = binset.GetByName(Type());
+        if (binary == nullptr) {
+            LOG_KNOWHERE_ERROR_ << "Invalid BinarySet.";
+            return Status::invalid_binary_set;
+        }
+        MemoryIOReader reader(binary->data.get(), binary->size);
+        auto index_or = CreateIndex</*mmapped=*/false>(cfg);
+        if (!index_or.has_value()) {
+            return index_or.error();
+        }
+        index_ = index_or.value();
+        if (version_use_raw_data()) {
+            return index_->DeserializeV0(reader, 0, "");
+        } else {
+            binary_ = binary;  // save the binary to avoid being freed
+            return index_->Deserialize(reader);
+        }
+    }
+
+    Status
+    DeserializeFromFile(const std::string& filename, std::shared_ptr<Config> config) override {
+        if (index_ != nullptr) {
+            LOG_KNOWHERE_WARNING_ << Type() << " has already been created, deleting old";
+            DeleteExistingIndex();
+        }
+
+        auto cfg = static_cast<const knowhere::SparseInvertedIndexConfig&>(*config);
+        auto index_or = CreateIndex</*mmapped=*/true>(cfg);
+        if (!index_or.has_value()) {
+            return index_or.error();
+        }
+        index_ = index_or.value();
+
+        auto reader = knowhere::FileReader(filename);
+        size_t map_size = reader.size();
+        int map_flags = MAP_SHARED;
+#ifdef MAP_POPULATE
+        if (cfg.enable_mmap_pop.has_value() && cfg.enable_mmap_pop.value()) {
+            map_flags |= MAP_POPULATE;
+        }
+#endif
+        void* mapped_memory = mmap(nullptr, map_size, PROT_READ, map_flags, reader.descriptor(), 0);
+        if (mapped_memory == MAP_FAILED) {
+            LOG_KNOWHERE_ERROR_ << "Failed to mmap file " << filename << ": " << strerror(errno);
+            return Status::disk_file_error;
+        }
+        auto mmap_guard = std::make_unique<MmapGuard>(map_size, filename, mapped_memory);
+        MemoryIOReader map_reader(reinterpret_cast<uint8_t*>(mapped_memory), map_size);
+        if (version_use_raw_data()) {
+            auto supplement_target_filename = filename + ".knowhere_sparse_index_supplement";
+            return index_->DeserializeV0(map_reader, map_flags, supplement_target_filename);
+        } else {
+            mmap_guard_ = std::move(mmap_guard);
+            return index_->Deserialize(map_reader);
+        }
+    }
+
+    static std::unique_ptr<BaseConfig>
+    StaticCreateConfig() {
+        return std::make_unique<SparseInvertedIndexConfig>();
+    }
+
+    [[nodiscard]] std::unique_ptr<BaseConfig>
+    CreateConfig() const override {
+        return StaticCreateConfig();
+    }
+
+    // note that the Dim of a sparse vector index may change as new vectors are added
+    [[nodiscard]] int64_t
+    Dim() const override {
+        return index_ ? index_->n_cols() : 0;
+    }
+
+    [[nodiscard]] int64_t
+    Size() const override {
+        return index_ ? index_->size() : 0;
+    }
+
+    [[nodiscard]] int64_t
+    Count() const override {
+        return index_ ? index_->n_rows() : 0;
+    }
+
+    [[nodiscard]] std::string
+    Type() const override {
+        return use_wand ? knowhere::IndexEnum::INDEX_SPARSE_WAND : knowhere::IndexEnum::INDEX_SPARSE_INVERTED_INDEX;
+    }
+
+ private:
+    template <bool mmapped>
+    expected<sparse::BaseInvertedIndex<value_type>*>
+    CreateIndex(const SparseInvertedIndexConfig& cfg) const {
+        if (IsMetricType(cfg.metric_type.value(), metric::BM25)) {
+            if (!cfg.bm25_k1.has_value() || !cfg.bm25_b.has_value() || !cfg.bm25_avgdl.has_value()) {
+                return expected<sparse::BaseInvertedIndex<value_type>*>::Err(
+                    Status::invalid_args, "BM25 parameters k1, b, and avgdl must be set when building/loading");
+            }
+            auto k1 = cfg.bm25_k1.value();
+            auto b = cfg.bm25_b.value();
+            auto avgdl = cfg.bm25_avgdl.value();
+            // avgdl is used as a denominator in BM25 score computation,
+            // so it should be at least 1.0 to avoid division by zero.
+            avgdl = std::max(avgdl, 1.0f);
+
+            if (use_wand || cfg.inverted_index_algo.value() == "DAAT_WAND") {
+                auto index =
+                    new sparse::InvertedIndex<value_type, uint16_t, sparse::InvertedIndexAlgo::DAAT_WAND, mmapped>(
+                        sparse::SparseMetricType::METRIC_BM25);
+                index->SetBM25Params(k1, b, avgdl);
+                return index;
+            } else if (cfg.inverted_index_algo.value() == "DAAT_MAXSCORE") {
+                auto index =
+                    new sparse::InvertedIndex<value_type, uint16_t, sparse::InvertedIndexAlgo::DAAT_MAXSCORE, mmapped>(
+                        sparse::SparseMetricType::METRIC_BM25);
+                index->SetBM25Params(k1, b, avgdl);
+                return index;
+            } else if (cfg.inverted_index_algo.value() == "TAAT_NAIVE") {
+                auto index =
+                    new sparse::InvertedIndex<value_type, uint16_t, sparse::InvertedIndexAlgo::TAAT_NAIVE, mmapped>(
+                        sparse::SparseMetricType::METRIC_BM25);
+                index->SetBM25Params(k1, b, avgdl);
+                return index;
+            } else {
+                return expected<sparse::BaseInvertedIndex<value_type>*>::Err(
+                    Status::invalid_args, "Invalid search algorithm for SparseInvertedIndex");
+            }
+        } else {
+            if (use_wand || cfg.inverted_index_algo.value() == "DAAT_WAND") {
+                auto index =
+                    new sparse::InvertedIndex<value_type, float, sparse::InvertedIndexAlgo::DAAT_WAND, mmapped>(
+                        sparse::SparseMetricType::METRIC_IP);
+                return index;
+            } else if (cfg.inverted_index_algo.value() == "DAAT_MAXSCORE") {
+                auto index =
+                    new sparse::InvertedIndex<value_type, float, sparse::InvertedIndexAlgo::DAAT_MAXSCORE, mmapped>(
+                        sparse::SparseMetricType::METRIC_IP);
+                return index;
+            } else if (cfg.inverted_index_algo.value() == "TAAT_NAIVE") {
+                auto index =
+                    new sparse::InvertedIndex<value_type, float, sparse::InvertedIndexAlgo::TAAT_NAIVE, mmapped>(
+                        sparse::SparseMetricType::METRIC_IP);
+                return index;
+            } else {
+                return expected<sparse::BaseInvertedIndex<value_type>*>::Err(
+                    Status::invalid_args, "Invalid search algorithm for SparseInvertedIndex");
+            }
+        }
+    }
+
+    void
+    DeleteExistingIndex() {
+        if (index_ != nullptr) {
+            delete index_;
+            index_ = nullptr;
+        }
+    }
+
+    [[nodiscard]] bool
+    version_use_raw_data() const {
+        return index_version_ < 8;
+    }
+
+    struct MmapGuard {
+        size_t map_size;
+        std::string filename;
+        void* map_addr;
+
+        MmapGuard(size_t size, const std::string& fname, void* addr) : map_size(size), filename(fname), map_addr(addr) {
+        }
+
+        ~MmapGuard() {
+            if (munmap(map_addr, map_size) != 0) {
+                LOG_KNOWHERE_ERROR_ << "Failed to munmap file " << filename << ": " << strerror(errno);
+            }
+        }
+    };
+
+    sparse::BaseInvertedIndex<value_type>* index_{};
+    std::shared_ptr<ThreadPool> search_pool_;
+    std::shared_ptr<ThreadPool> build_pool_;
+    const int32_t index_version_;
+    BinaryPtr binary_{nullptr};
+    std::unique_ptr<MmapGuard> mmap_guard_{nullptr};
+};  // class SparseInvertedIndexNode
+
+// Concurrent version of SparseInvertedIndexNode
+//
+// Thread safety: only the overridden methods are allowed to be called concurrently.
+template <typename T, bool use_wand>
+class SparseInvertedIndexNodeCC : public SparseInvertedIndexNode<T, use_wand> {
+    static_assert(std::is_same_v<T, knowhere::sparse_u32_f32>, "SparseInvertedIndexNode only support sparse_u32_f32");
+    using value_type = typename T::ValueType;
+
+ public:
+    explicit SparseInvertedIndexNodeCC(const int32_t& version, const Object& object)
+        : SparseInvertedIndexNode<T, use_wand>(version, object) {
+    }
+
+    Status
+    Add(const DataSetPtr dataset, std::shared_ptr<Config> config, bool use_knowhere_build_pool) override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        uint64_t task_id = next_task_id_++;
+        add_tasks_.push(task_id);
+
+        // add task is allowed to run only after all search tasks that come before it have finished.
+        cv_.wait(lock, [this, task_id]() { return current_task_id_ == task_id && active_readers_ == 0; });
+
+        auto res = SparseInvertedIndexNode<T, use_wand>::Add(dataset, config, use_knowhere_build_pool);
+
+        auto cfg = static_cast<const SparseInvertedIndexConfig&>(*config);
+        if (IsMetricType(cfg.metric_type.value(), metric::IP)) {
+            // insert dataset to raw data if metric type is IP
+            auto data = static_cast<const sparse::SparseRow<value_type>*>(dataset->GetTensor());
+            auto rows = dataset->GetRows();
+            raw_data_.insert(raw_data_.end(), data, data + rows);
+        }
+
+        add_tasks_.pop();
+        current_task_id_++;
+        lock.unlock();
+        cv_.notify_all();
+        return res;
+    }
+
+    expected<DataSetPtr>
+    Search(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
+           milvus::OpContext* op_context) const override {
+        ReadPermission permission(*this);
+        return SparseInvertedIndexNode<T, use_wand>::Search(dataset, std::move(cfg), bitset, op_context);
+    }
+
+    expected<std::vector<IndexNode::IteratorPtr>>
+    AnnIterator(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
+                bool use_knowhere_search_pool, milvus::OpContext* op_context) const override {
+        ReadPermission permission(*this);
+        // Always uses PrecomputedDistanceIterator for SparseInvertedIndexNodeCC:
+        // If we want to use RefineIterator, it needs to get another ReadPermission when calling
+        // index_->GetRawDistance(). If an Add task is added in between, there will be a deadlock.
+        auto config = static_cast<const knowhere::SparseInvertedIndexConfig&>(*cfg);
+        config.drop_ratio_search = 0.0f;
+        return SparseInvertedIndexNode<T, use_wand>::AnnIterator(dataset, std::move(cfg), bitset,
+                                                                 use_knowhere_search_pool, op_context);
+    }
+
+    expected<DataSetPtr>
+    RangeSearch(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
+                milvus::OpContext* op_context) const override {
+        ReadPermission permission(*this);
+        return SparseInvertedIndexNode<T, use_wand>::RangeSearch(dataset, std::move(cfg), bitset, op_context);
+    }
+
+    int64_t
+    Dim() const override {
+        ReadPermission permission(*this);
+        return SparseInvertedIndexNode<T, use_wand>::Dim();
+    }
+
+    int64_t
+    Size() const override {
+        ReadPermission permission(*this);
+        return SparseInvertedIndexNode<T, use_wand>::Size();
+    }
+
+    int64_t
+    Count() const override {
+        ReadPermission permission(*this);
+        return SparseInvertedIndexNode<T, use_wand>::Count();
+    }
+
+    std::string
+    Type() const override {
+        return use_wand ? knowhere::IndexEnum::INDEX_SPARSE_WAND_CC
+                        : knowhere::IndexEnum::INDEX_SPARSE_INVERTED_INDEX_CC;
+    }
+
+    expected<DataSetPtr>
+    GetVectorByIds(const DataSetPtr dataset, milvus::OpContext* op_context) const override {
+        ReadPermission permission(*this);
+
+        if (raw_data_.empty()) {
+            return expected<DataSetPtr>::Err(Status::invalid_args, "GetVectorByIds failed: raw data is empty");
+        }
+
+        auto rows = dataset->GetRows();
+        auto ids = dataset->GetIds();
+        auto data = std::make_unique<sparse::SparseRow<value_type>[]>(rows);
+        int64_t dim = 0;
+
+        try {
+            for (int64_t i = 0; i < rows; ++i) {
+                data[i] = raw_data_[ids[i]];
+                dim = std::max(dim, data[i].dim());
+            }
+        } catch (std::exception& e) {
+            return expected<DataSetPtr>::Err(Status::invalid_args, "GetVectorByIds failed: " + std::string(e.what()));
+        }
+
+        auto res = GenResultDataSet(rows, dim, data.release());
+        res->SetIsSparse(true);
+
+        return res;
+    }
+
+    static bool
+    StaticHasRawData(const knowhere::BaseConfig& config, const IndexVersion& version) {
+        if (!config.metric_type.has_value()) {
+            return false;
+        }
+        return IsMetricType(config.metric_type.value(), metric::IP);
+    }
+
+    [[nodiscard]] bool
+    HasRawData(const std::string& metric_type) const override {
+        return IsMetricType(metric_type, metric::IP);
+    }
+
+    Status
+    Deserialize(const BinarySet& binset, std::shared_ptr<Config> config) override {
+        return Status::not_implemented;
+    }
+
+    Status
+    DeserializeFromFile(const std::string& filename, std::shared_ptr<Config> config) override {
+        return Status::not_implemented;
+    }
+
+ private:
+    struct ReadPermission {
+        ReadPermission(const SparseInvertedIndexNodeCC& node) : node_(node) {
+            std::unique_lock<std::mutex> lock(node_.mutex_);
+            uint64_t task_id = node_.next_task_id_++;
+            // read task may execute only after all add tasks that come before it have finished.
+            if (!node_.add_tasks_.empty() && task_id > node_.add_tasks_.front()) {
+                node_.cv_.wait(
+                    lock, [this, task_id]() { return node_.add_tasks_.empty() || task_id < node_.add_tasks_.front(); });
+            }
+            // read task is allowed to run, block all add tasks
+            node_.active_readers_++;
+        }
+
+        ~ReadPermission() {
+            std::unique_lock<std::mutex> lock(node_.mutex_);
+            node_.active_readers_--;
+            node_.current_task_id_++;
+            node_.cv_.notify_all();
+        }
+        const SparseInvertedIndexNodeCC& node_;
+    };
+
+    mutable std::mutex mutex_;
+    mutable std::condition_variable cv_;
+    mutable int64_t active_readers_ = 0;
+    mutable std::queue<uint64_t> add_tasks_;
+    mutable uint64_t next_task_id_ = 0;
+    mutable uint64_t current_task_id_ = 0;
+    mutable std::vector<sparse::SparseRow<value_type>> raw_data_ = {};
+};  // class SparseInvertedIndexNodeCC
+
+#ifdef KNOWHERE_WITH_CARDINAL
+KNOWHERE_SIMPLE_REGISTER_SPARSE_FLOAT_GLOBAL(SPARSE_INVERTED_INDEX_DEPRECATED, SparseInvertedIndexNode,
+                                             knowhere::feature::MMAP,
+                                             /*use_wand=*/false)
+KNOWHERE_SIMPLE_REGISTER_SPARSE_FLOAT_GLOBAL(SPARSE_WAND_DEPRECATED, SparseInvertedIndexNode, knowhere::feature::MMAP,
+                                             /*use_wand=*/true)
+KNOWHERE_SIMPLE_REGISTER_SPARSE_FLOAT_GLOBAL(SPARSE_INVERTED_INDEX_CC_DEPRECATED, SparseInvertedIndexNodeCC,
+                                             knowhere::feature::MMAP,
+                                             /*use_wand=*/false)
+KNOWHERE_SIMPLE_REGISTER_SPARSE_FLOAT_GLOBAL(SPARSE_WAND_CC_DEPRECATED, SparseInvertedIndexNodeCC,
+                                             knowhere::feature::MMAP,
+                                             /*use_wand=*/true)
+#else
+KNOWHERE_SIMPLE_REGISTER_SPARSE_FLOAT_GLOBAL(SPARSE_INVERTED_INDEX, SparseInvertedIndexNode, knowhere::feature::MMAP,
+                                             /*use_wand=*/false)
+KNOWHERE_SIMPLE_REGISTER_SPARSE_FLOAT_GLOBAL(SPARSE_WAND, SparseInvertedIndexNode, knowhere::feature::MMAP,
+                                             /*use_wand=*/true)
+KNOWHERE_SIMPLE_REGISTER_SPARSE_FLOAT_GLOBAL(SPARSE_INVERTED_INDEX_CC, SparseInvertedIndexNodeCC,
+                                             knowhere::feature::MMAP,
+                                             /*use_wand=*/false)
+KNOWHERE_SIMPLE_REGISTER_SPARSE_FLOAT_GLOBAL(SPARSE_WAND_CC, SparseInvertedIndexNodeCC, knowhere::feature::MMAP,
+                                             /*use_wand=*/true)
+#endif
+}  // namespace knowhere
