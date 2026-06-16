@@ -6,7 +6,7 @@ RVANNS is an artifact built on top of Knowhere/Faiss for approximate nearest nei
 
 ## Artifact Notes
 
-This artifact includes the optimized implementation, patches, and test programs used for evaluation. The SLOC counting policy excludes third-party code under `thirdparty/` and includes tests and build scripts. Under this policy, the artifact contains approximately 57K SLOC.
+This artifact includes the optimized implementation, patches, and test programs used for evaluation. The SLOC counting policy excludes third-party code under `thirdparty/` and includes tests and build scripts. Under this policy, the artifact contains 57,289 SLOC.
 
 The main RVANNS-related files are:
 
