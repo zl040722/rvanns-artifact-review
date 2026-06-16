@@ -1,16 +1,28 @@
-<p>
-    <img src="static/knowhere-logo.png" alt="Knowhere Logo"/>
-</p>
-
-This document will help you to build the Knowhere repository from source code and to run unit tests. Please [file an issue](https://github.com/zilliztech/knowhere/issues/new) if there's a problem.
+This document helps reviewers build the RVANNS artifact from source code, understand the code footprint, and run the included tests and evaluation scripts.
 
 ## Introduction
 
-Knowhere is written in C++. It is an independent project that act as Milvus's internal core.
+RVANNS is an artifact built on top of Knowhere/Faiss for approximate nearest neighbor search experiments. The repository keeps the upstream C++ vector search library structure, adds HNSW graph reordering support through `IndexHNSW::reorder_graph_after_build`, and provides standalone RVANNS evaluation programs for HNSW, HNSW-SQ/MPMI, and ROrder-style graph layout experiments. The added programs load vector datasets, build or reuse cached indexes, compute or read ground truth, sweep search parameters, and write recall/QPS/latency results into `vectors_out/results`.
 
 ## Artifact Notes
 
-This artifact includes the optimized implementation, patches, and test programs used for evaluation. The SLOC counting policy excludes third-party code under `thirdparty/` and includes tests and build scripts. Under this policy, the artifact contains approximately 57K SLOC.
+This artifact includes the optimized implementation, patches, and test programs used for evaluation. The SLOC counting policy excludes third-party code under `thirdparty/` and includes tests and build scripts. Under this policy, the artifact contains approximately 64K non-empty source lines.
+
+The main RVANNS-related files are:
+
+- `thirdparty/faiss/faiss/IndexHNSW.h` and `thirdparty/faiss/faiss/IndexHNSW.cpp`: add post-build graph reordering APIs, keep the `perm[new_id]=old_id` mapping, and support BFS and `gorder` traversal methods.
+- `tests/rvanns/`: contains five standalone C++ test and performance programs, about 3K non-empty source lines in total.
+- `scripts/`, `ci/`, `CMakeLists.txt`, and `conanfile.py`: provide dependency installation, build, coverage, and CI entry points used by the artifact.
+
+The RVANNS test programs are:
+
+- `test_hnsw_224.cpp`: HNSW baseline sweep over datasets and `efSearch` values.
+- `test_hnsw_rorder_perf.cpp`: HNSW batch-search performance test with perf counter collection.
+- `test_mpmi.cpp`: HNSW-SQ/MPMI evaluation with optional graph reordering and CSV output to `vectors_out/results/hnsw_efs_rorder_sweep.csv`.
+- `test_mpmi_perf.cpp`: MPMI-focused performance test.
+- `test_vec_mpmi_rorder_perf.cpp`: HNSW-SQ/MPMI plus ROrder batch-search performance test.
+
+The regular Knowhere unit tests are built when `with_ut=True`/`WITH_UT=ON` is enabled and run through `knowhere_tests`. Faiss tests can be enabled with `with_faiss_tests=True`/`WITH_FAISS_TESTS=ON`. The Python tests live under `tests/python/`, and CI/E2E coverage is described by the Jenkins/Groovy files under `ci/`.
 
 ## Building Knowhere Within Milvus
 
