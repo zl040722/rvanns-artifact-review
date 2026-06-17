@@ -9,6 +9,7 @@
 
 #include <omp.h>
 #include <cassert>
+#include <cctype>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -213,7 +214,7 @@ class AlignedFlatDistanceComputer : public DistanceComputer {
     const uint8_t* base_;
     const float* q_ = nullptr;
 
-public:
+   public:
     AlignedFlatDistanceComputer(
             MetricType metric_type,
             size_t d,
@@ -246,7 +247,8 @@ public:
                 return fvec_inner_product(q_, xb, d_);
             default:
                 FAISS_THROW_IF_NOT_MSG(
-                        false, "AlignedFlatDistanceComputer only supports L2/IP");
+                        false,
+                        "AlignedFlatDistanceComputer only supports L2/IP");
         }
     }
 
@@ -266,7 +268,8 @@ public:
 
         switch (metric_type_) {
             case METRIC_L2:
-                fvec_L2sqr_batch_4(q_, y0, y1, y2, y3, d_, dis0, dis1, dis2, dis3);
+                fvec_L2sqr_batch_4(
+                        q_, y0, y1, y2, y3, d_, dis0, dis1, dis2, dis3);
                 return;
             case METRIC_INNER_PRODUCT:
                 dis0 = fvec_inner_product(q_, y0, d_);
@@ -276,7 +279,8 @@ public:
                 return;
             default:
                 FAISS_THROW_IF_NOT_MSG(
-                        false, "AlignedFlatDistanceComputer only supports L2/IP");
+                        false,
+                        "AlignedFlatDistanceComputer only supports L2/IP");
         }
     }
 
@@ -290,7 +294,8 @@ public:
                 return fvec_inner_product(xi, xj, d_);
             default:
                 FAISS_THROW_IF_NOT_MSG(
-                        false, "AlignedFlatDistanceComputer only supports L2/IP");
+                        false,
+                        "AlignedFlatDistanceComputer only supports L2/IP");
         }
     }
 };
@@ -462,12 +467,12 @@ void hnsw_add_vertices(
 
 IndexHNSW::IndexHNSW(int d, int M, MetricType metric)
         : Index(d, metric), hnsw(M) {
-    reorder_perm.clear();  // 确保初始化为空
+    reorder_perm.clear(); // 确保初始化为空
 }
 
 IndexHNSW::IndexHNSW(Index* storage, int M)
         : Index(storage->d, storage->metric_type), hnsw(M), storage(storage) {
-    reorder_perm.clear();  // 确保初始化为空
+    reorder_perm.clear(); // 确保初始化为空
 }
 
 IndexHNSW::IndexHNSW(const IndexHNSW& other)
@@ -479,7 +484,8 @@ IndexHNSW::IndexHNSW(const IndexHNSW& other)
           keep_max_size_level0(other.keep_max_size_level0),
           reorder_perm(other.reorder_perm) {
     if (other.cache_aligned_soa_) {
-        cache_aligned_soa_ = std::make_unique<CacheAlignedCoLayout>(*other.cache_aligned_soa_);
+        cache_aligned_soa_ = std::make_unique<CacheAlignedCoLayout>(
+                *other.cache_aligned_soa_);
     }
     pending_cacheline_layout_build_ = other.pending_cacheline_layout_build_;
 }
@@ -496,8 +502,8 @@ IndexHNSW& IndexHNSW::operator=(const IndexHNSW& other) {
     keep_max_size_level0 = other.keep_max_size_level0;
     reorder_perm = other.reorder_perm;
     if (other.cache_aligned_soa_) {
-        cache_aligned_soa_ =
-                std::make_unique<CacheAlignedCoLayout>(*other.cache_aligned_soa_);
+        cache_aligned_soa_ = std::make_unique<CacheAlignedCoLayout>(
+                *other.cache_aligned_soa_);
     } else {
         cache_aligned_soa_.reset();
     }
@@ -555,7 +561,8 @@ void hnsw_search(
             VisitedTable vt(index->ntotal);
             typename BlockResultHandler::SingleResultHandler res(bres);
 
-            std::unique_ptr<DistanceComputer> dis(index->make_distance_computer());
+            std::unique_ptr<DistanceComputer> dis(
+                    index->make_distance_computer());
 
 #pragma omp for reduction(+ : n1, n2, ndis, nhops) schedule(guided)
             for (idx_t i = i0; i < i1; i++) {
@@ -635,7 +642,7 @@ void IndexHNSW::reset() {
     hnsw.reset();
     storage->reset();
     ntotal = 0;
-    reorder_perm.clear();  // 清除重排序映射
+    reorder_perm.clear(); // 清除重排序映射
 }
 
 void IndexHNSW::reconstruct(idx_t key, float* recons) const {
@@ -729,9 +736,7 @@ void IndexHNSW::search_level_0(
             vt.advance();
         }
 #pragma omp critical
-        {
-            hnsw_stats.combine(search_stats);
-        }
+        { hnsw_stats.combine(search_stats); }
     }
     if (is_similarity_metric(this->metric_type)) {
 // we need to revert the negated distances
@@ -859,19 +864,19 @@ void IndexHNSW::optimize_neighbors_by_id() {
     }
     int M = hnsw.nb_neighbors(0);
     const storage_idx_t ntotal_local = ntotal;
-    
+
 #pragma omp parallel
     {
         // 每个线程有自己的临时数组，避免竞争
         std::vector<storage_idx_t> tmp(M);
-        
+
         // 并行处理每个节点
         // 不同节点的邻居范围互不重叠，可以安全并行
 #pragma omp for schedule(static)
         for (storage_idx_t i = 0; i < ntotal_local; i++) {
             size_t begin, end;
             hnsw.neighbor_range(i, 0, &begin, &end);
-            
+
             // 收集有效的neighbors到临时数组
             int valid_count = 0;
             for (size_t j = begin; j < end; j++) {
@@ -881,10 +886,10 @@ void IndexHNSW::optimize_neighbors_by_id() {
                 }
                 tmp[valid_count++] = nj;
             }
-            
+
             // 对邻居ID排序
             std::sort(tmp.begin(), tmp.begin() + valid_count);
-            
+
             // 写回排序后的neighbors
             // 安全：每个线程只写入自己节点的范围 [begin, end)
             // 不同线程处理不同节点，范围不重叠，无竞争条件
@@ -897,7 +902,7 @@ void IndexHNSW::optimize_neighbors_by_id() {
             }
         }
     }
-    
+
     if (verbose) {
         printf("优化neighbors顺序完成（并行版本）\n");
     }
@@ -947,7 +952,7 @@ void IndexHNSW::permute_entries(const idx_t* perm) {
     invalidate_cacheline_layout();
     flat_storage->permute_entries(perm);
     hnsw.permute_entries(perm);
-    
+
     // Handle Cosine inverse_l2_norms if present
     auto reorder_inverse_norms = [&](std::vector<float>& norms) {
         if (norms.size() != (size_t)ntotal)
@@ -958,7 +963,7 @@ void IndexHNSW::permute_entries(const idx_t* perm) {
         }
         norms.swap(new_norms);
     };
-    
+
     // Check for Cosine variants and reorder their inverse_l2_norms
     if (auto* s = dynamic_cast<IndexFlatCosine*>(storage)) {
         reorder_inverse_norms(s->inverse_norms_storage.inverse_l2_norms);
@@ -1006,31 +1011,34 @@ void IndexHNSW::apply_cacheline_co_layout_to_storage() {
     uint8_t* dst_codes = layout.codes.ptr();
     for (idx_t i = 0; i < ntotal; i++) {
         uint8_t* row_dst = dst_codes + layout.code_stride * i;
-        memcpy(row_dst, src_codes + layout.code_row_bytes * i, layout.code_row_bytes);
+        memcpy(row_dst,
+               src_codes + layout.code_row_bytes * i,
+               layout.code_row_bytes);
         if (layout.code_stride > layout.code_row_bytes) {
-            memset(
-                    row_dst + layout.code_row_bytes,
-                    0,
-                    layout.code_stride - layout.code_row_bytes);
+            memset(row_dst + layout.code_row_bytes,
+                   0,
+                   layout.code_stride - layout.code_row_bytes);
         }
     }
 
     if (!flat_storage->code_norms.empty()) {
         layout.code_norm_row_bytes = sizeof(float);
-        layout.code_norm_stride = round_up_to_cacheline(layout.code_norm_row_bytes);
+        layout.code_norm_stride =
+                round_up_to_cacheline(layout.code_norm_row_bytes);
         layout.code_norms.resize(ntotal * layout.code_norm_stride);
 
-        const uint8_t* src_norms =
-                reinterpret_cast<const uint8_t*>(flat_storage->code_norms.data());
+        const uint8_t* src_norms = reinterpret_cast<const uint8_t*>(
+                flat_storage->code_norms.data());
         uint8_t* dst_norms = layout.code_norms.ptr();
         for (idx_t i = 0; i < ntotal; i++) {
             uint8_t* row_dst = dst_norms + layout.code_norm_stride * i;
-            memcpy(row_dst, src_norms + layout.code_norm_row_bytes * i, layout.code_norm_row_bytes);
+            memcpy(row_dst,
+                   src_norms + layout.code_norm_row_bytes * i,
+                   layout.code_norm_row_bytes);
             if (layout.code_norm_stride > layout.code_norm_row_bytes) {
-                memset(
-                        row_dst + layout.code_norm_row_bytes,
-                        0,
-                        layout.code_norm_stride - layout.code_norm_row_bytes);
+                memset(row_dst + layout.code_norm_row_bytes,
+                       0,
+                       layout.code_norm_stride - layout.code_norm_row_bytes);
             }
         }
     }
@@ -1041,7 +1049,7 @@ void IndexHNSW::apply_cacheline_co_layout_to_storage() {
 IndexHNSW::CacheAlignedLayoutInfo IndexHNSW::get_cache_aligned_codes() const {
     CacheAlignedLayoutInfo info;
     if (cache_aligned_soa_ && cache_aligned_soa_->enabled &&
-            cache_aligned_soa_->code_stride != 0) {
+        cache_aligned_soa_->code_stride != 0) {
         info.enabled = true;
         info.count = cache_aligned_soa_->count;
         info.stride = cache_aligned_soa_->code_stride;
@@ -1055,7 +1063,7 @@ IndexHNSW::CacheAlignedLayoutInfo IndexHNSW::get_cache_aligned_code_norms()
         const {
     CacheAlignedLayoutInfo info;
     if (cache_aligned_soa_ && cache_aligned_soa_->enabled &&
-            cache_aligned_soa_->code_norm_stride != 0) {
+        cache_aligned_soa_->code_norm_stride != 0) {
         info.enabled = true;
         info.count = cache_aligned_soa_->count;
         info.stride = cache_aligned_soa_->code_norm_stride;
@@ -1072,8 +1080,8 @@ DistanceComputer* IndexHNSW::make_distance_computer() const {
     if (cache_aligned_soa_ && cache_aligned_soa_->enabled && storage) {
         auto* flat_storage = dynamic_cast<IndexFlat*>(storage);
         if (flat_storage &&
-                (flat_storage->metric_type == METRIC_L2 ||
-                 flat_storage->metric_type == METRIC_INNER_PRODUCT)) {
+            (flat_storage->metric_type == METRIC_L2 ||
+             flat_storage->metric_type == METRIC_INNER_PRODUCT)) {
             auto info = get_cache_aligned_codes();
             if (info.enabled && info.data) {
                 DistanceComputer* dc = new AlignedFlatDistanceComputer(
@@ -1100,58 +1108,24 @@ void IndexHNSW::reorder_graph_after_build(
         return;
     }
     FAISS_THROW_IF_NOT_MSG(level == 0, "Only level-0 reordering is supported");
-    
+
     const idx_t N = ntotal;
-    
-    if (method && strcmp(method, "gorder") == 0) {
-        std::vector<idx_t> perm = generateGorderPermutation();
+
+    std::vector<idx_t> perm;
+    perm.reserve(N);
+
+    if (strcmp(method, "rorder") == 0) {
+        perm = generateRorderPermutation();
         reorder_perm = perm;
         this->permute_entries(perm.data());
-        
+
         if (verbose) {
-            printf("Gorder重排序完成，正在优化neighbors顺序...\n");
+            printf("ROrder重排序完成，正在优化neighbors顺序...\n");
         }
         optimize_neighbors_by_id();
-    } else {
-        // Default to BFS reordering
-        std::vector<uint8_t> visited(N, 0);
-        std::vector<idx_t> perm; // perm[new_id] = old_id
-        perm.reserve(N);
-        auto bfs_traversal = [&](storage_idx_t start) {
-            if (visited[start])
-                return;
-            std::queue<storage_idx_t> q;
-            q.push(start);
-            visited[start] = 1;
-            while (!q.empty()) {
-                storage_idx_t u = q.front();
-                q.pop();
-                perm.push_back(u);
-                size_t begin, end;
-                hnsw.neighbor_range(u, level, &begin, &end);
-                for (size_t j = begin; j < end; j++) {
-                    storage_idx_t v = hnsw.neighbors[j];
-                    if (v < 0)
-                        break;
-                    if (!visited[v]) {
-                        visited[v] = 1;
-                        q.push(v);
-                    }
-                }
-            }
-        };
-        bfs_traversal(hnsw.entry_point);
-        
-        for (storage_idx_t i = 0; i < N; i++) {
-            if (!visited[i]) {
-                bfs_traversal(i);
-            }
-        }
-        // 保存映射关系：perm[new_id] = old_id
-        reorder_perm = perm;
-        
-        this->permute_entries(perm.data());
     }
+
+    (void)freeze;
 }
 
 namespace {
@@ -1179,32 +1153,33 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
-class GorderListElement {
-public:
+class RorderListElement {
+   public:
     int key;
     int prev;
     int next;
 };
 
-class GorderHeadEnd {
-public:
+class RorderHeadEnd {
+   public:
     int first;
     int second;
-    GorderHeadEnd() {
+    RorderHeadEnd() {
         first = -1;
         second = -1;
     }
 };
 
 class UnitHeap {
-public:
+   public:
     std::vector<int> update;
-    std::vector<GorderListElement> LinkedList;
-    std::vector<GorderHeadEnd> Header;
+    std::vector<RorderListElement> LinkedList;
+    std::vector<RorderHeadEnd> Header;
     int top{0};
     int heapsize{0};
 
-    explicit UnitHeap(int size) : update(size), LinkedList(size), heapsize(size) {
+    explicit UnitHeap(int size)
+            : update(size), LinkedList(size), heapsize(size) {
         if (size > 0) {
             Header.clear();
             Header.resize(std::max(size >> 4, 4));
@@ -1226,8 +1201,10 @@ public:
         int next = LinkedList[index].next;
         int key = LinkedList[index].key;
 
-        if (prev >= 0) LinkedList[prev].next = next;
-        if (next >= 0) LinkedList[next].prev = prev;
+        if (prev >= 0)
+            LinkedList[prev].next = next;
+        if (next >= 0)
+            LinkedList[next].prev = prev;
 
         if (Header[key].first == Header[key].second) {
             Header[key].first = Header[key].second = -1;
@@ -1247,7 +1224,8 @@ public:
         int tmptop;
         do {
             tmptop = top;
-            if (update[top] < 0) DecreaseTop();
+            if (update[top] < 0)
+                DecreaseTop();
         } while (top != tmptop);
         DeleteElement(tmptop);
         return tmptop;
@@ -1276,7 +1254,8 @@ public:
             LinkedList[top].prev = psecond;
             LinkedList[top].next = tailnext;
             LinkedList[psecond].next = tmptop;
-            if (tailnext >= 0) LinkedList[tailnext].prev = tmptop;
+            if (tailnext >= 0)
+                LinkedList[tailnext].prev = tmptop;
             top = next;
 
             if (Header[key].first == Header[key].second)
@@ -1287,13 +1266,15 @@ public:
             LinkedList[tmptop].key = newkey;
             update[tmptop] /= 2; /**/
             Header[newkey].second = tmptop;
-            if (Header[newkey].first < 0) Header[newkey].first = tmptop;
+            if (Header[newkey].first < 0)
+                Header[newkey].first = tmptop;
         }
     }
 
     void ReConstruct() {
         std::vector<int> tmp(heapsize);
-        for (int i = 0; i < heapsize; i++) tmp[i] = i;
+        for (int i = 0; i < heapsize; i++)
+            tmp[i] = i;
 
         std::sort(tmp.begin(), tmp.end(), [&](int a, int b) {
             return LinkedList[a].key > LinkedList[b].key;
@@ -1304,7 +1285,8 @@ public:
         LinkedList[tmp[0]].prev = -1;
         LinkedList[tmp.back()].next = -1;
         LinkedList[tmp.back()].prev = tmp[tmp.size() - 2];
-        Header = std::vector<GorderHeadEnd>(std::max(key + 1, (int)Header.size()));
+        Header = std::vector<RorderHeadEnd>(
+                std::max(key + 1, (int)Header.size()));
         Header[key].first = tmp[0];
         for (int i = 1; i < tmp.size() - 1; i++) {
             int prev = tmp[i - 1];
@@ -1339,13 +1321,15 @@ public:
 
         if (head != index) {
             LinkedList[prev].next = next;
-            if (next >= 0) LinkedList[next].prev = prev;
+            if (next >= 0)
+                LinkedList[next].prev = prev;
 
             int headprev = LinkedList[head].prev;
             LinkedList[index].prev = headprev;
             LinkedList[index].next = head;
             LinkedList[head].prev = index;
-            if (headprev >= 0) LinkedList[headprev].next = index;
+            if (headprev >= 0)
+                LinkedList[headprev].next = index;
         }
 
         LinkedList[index].key++;
@@ -1358,15 +1342,18 @@ public:
 
         key++;
         Header[key].second = index;
-        if (Header[key].first < 0) Header[key].first = index;
-        if (LinkedList[top].key < key) top = index;
-        if ((size_t)(key + 4) >= Header.size()) Header.resize(Header.size() * 1.5);
+        if (Header[key].first < 0)
+            Header[key].first = index;
+        if (LinkedList[top].key < key)
+            top = index;
+        if ((size_t)(key + 4) >= Header.size())
+            Header.resize(Header.size() * 1.5);
     }
 };
 
 } // anonymous namespace
 
-std::vector<faiss::idx_t> IndexHNSW::generateGorderPermutation() {
+std::vector<faiss::idx_t> IndexHNSW::generateRorderPermutation() {
     const idx_t N = ntotal;
     const int window = 5;
 
@@ -1470,7 +1457,10 @@ std::vector<faiss::idx_t> IndexHNSW::generateGorderPermutation() {
                 if (outdegree[u] <= hugevertex) {
                     unitheap.update[u]--;
                     if (outdegree[u] > 1) {
-                        if (!std::binary_search(out_graph[u].begin(),out_graph[u].end(),v)) {
+                        if (!std::binary_search(
+                                    out_graph[u].begin(),
+                                    out_graph[u].end(),
+                                    v)) {
                             for (int w : out_graph[u]) {
                                 unitheap.update[w]--;
                             }

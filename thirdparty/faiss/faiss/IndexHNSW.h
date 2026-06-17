@@ -56,7 +56,8 @@ struct IndexHNSW : Index {
     bool keep_max_size_level0 = false;
 
     // ID mapping after reordering: perm[new_id] = old_id
-    // This is used to convert new IDs back to original IDs for recall calculation
+    // This is used to convert new IDs back to original IDs for recall
+    // calculation
     std::vector<idx_t> reorder_perm;
 
     explicit IndexHNSW(int d = 0, int M = 32, MetricType metric = METRIC_L2);
@@ -130,24 +131,31 @@ struct IndexHNSW : Index {
 
     void permute_entries(const idx_t* perm);
 
-
     /**
-     * Reorder nodes using graph traversal algorithms to improve spatial locality.
-     * This should be called after all vectors are added but before saving to disk.
-     * 
-     * @param level Graph level to use for traversal (default: 0, only level-0 supported)
-     * @param method Traversal method ("bfs" or "gorder", default: "bfs")
-     * @param freeze Whether to freeze the index after reordering (default: true)
+     * Reorder nodes using graph traversal algorithms to improve spatial
+     * locality. This should be called after all vectors are added but before
+     * saving to disk.
+     *
+     * @param level Graph level to use for traversal (default: 0, only level-0
+     * supported)
+     * @param method Traversal method 
+     * @param freeze Whether to freeze the index after reordering (default:
+     * true)
      */
-    void reorder_graph_after_build(int level = 0, const char* method = "bfs", bool freeze = true);
+    void reorder_graph_after_build(
+            int level = 0,
+            const char* method = "bfs",
+            bool freeze = true);
 
     /**
      * Get the ID mapping after reordering: perm[new_id] = old_id
      * Returns empty vector if no reordering has been performed.
-     * 
+     *
      * @return Permutation array where perm[new_id] = old_id
      */
-    const std::vector<idx_t>& get_reorder_perm() const { return reorder_perm; }
+    const std::vector<idx_t>& get_reorder_perm() const {
+        return reorder_perm;
+    }
 
     CacheAlignedLayoutInfo get_cache_aligned_codes() const;
     CacheAlignedLayoutInfo get_cache_aligned_code_norms() const;
@@ -155,12 +163,13 @@ struct IndexHNSW : Index {
     /**
      * Convert new ID back to original ID using the reordering permutation.
      * Returns the same ID if no reordering has been performed.
-     * 
+     *
      * @param new_id The new ID after reordering
      * @return The original ID before reordering
      */
     idx_t convert_to_original_id(idx_t new_id) const {
-        if (reorder_perm.empty() || new_id < 0 || new_id >= (idx_t)reorder_perm.size()) {
+        if (reorder_perm.empty() || new_id < 0 ||
+            new_id >= (idx_t)reorder_perm.size()) {
             return new_id;
         }
         return reorder_perm[new_id];
@@ -169,9 +178,9 @@ struct IndexHNSW : Index {
     DistanceComputer* get_distance_computer() const override;
     DistanceComputer* make_distance_computer() const;
 
-private:
-    // Generate Gorder permutation for graph reordering
-    std::vector<idx_t> generateGorderPermutation();
+   private:
+    // Generate Rorder permutation for graph reordering
+    std::vector<idx_t> generateRorderPermutation();
 
     struct CacheAlignedCoLayout;
     std::unique_ptr<CacheAlignedCoLayout> cache_aligned_soa_;
