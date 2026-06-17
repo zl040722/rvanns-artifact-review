@@ -1,32 +1,32 @@
-This document helps reviewers build the RVANNS artifact from source code, understand the code footprint, and run the included tests and evaluation scripts.
+This document helps reviewers build the artifact from source code, understand its code footprint, and run the included tests and evaluation scripts.
 
 ## Introduction
 
-RVANNS is an artifact for approximate nearest neighbor search experiments on vector databases. The repository keeps a C++ vector search engine structure, adds HNSW graph reordering support through `IndexHNSW::reorder_graph_after_build`, and provides standalone RVANNS evaluation programs for HNSW, HNSW-SQ/MPMI, and ROrder-style graph layout experiments. The added programs load vector datasets, build or reuse cached indexes, compute or read ground truth, sweep search parameters, and write recall/QPS/latency results into `vectors_out/results`.
+This artifact supports approximate nearest neighbor search experiments on vector databases. The repository keeps a C++ vector search engine structure, adds post-build HNSW graph reordering support through `IndexHNSW::reorder_graph_after_build`, and provides standalone evaluation programs for HNSW, HNSW-SQ/MPMI, and graph-layout-aware batch-search experiments. The added programs load vector datasets, build or reuse cached indexes, compute or read ground truth, sweep search parameters, and write recall, QPS, and latency results into `vectors_out/results`.
 
 ## Artifact Notes
 
 This artifact includes the optimized implementation, patches, and test programs used for evaluation. The SLOC counting policy excludes third-party code under `thirdparty/` and includes tests and build scripts. Under this policy, the artifact contains 57,289 SLOC.
 
-The main RVANNS-related files are:
+The main artifact-related files are:
 
 - `thirdparty/faiss/faiss/IndexHNSW.h` and `thirdparty/faiss/faiss/IndexHNSW.cpp`: add post-build graph reordering APIs, keep the `perm[new_id]=old_id` mapping, and support BFS and `gorder` traversal methods.
-- `tests/rvanns/`: contains five standalone C++ test and performance programs, about 3K non-empty source lines in total.
+- the dedicated evaluation-test directory under `tests/`: contains five standalone C++ test and performance programs, about 3K non-empty source lines in total.
 - `scripts/`, `ci/`, `CMakeLists.txt`, and `conanfile.py`: provide dependency installation, build, coverage, and CI entry points used by the artifact.
 
-The RVANNS test programs are:
+The standalone evaluation programs cover:
 
-- `test_hnsw_224.cpp`: HNSW baseline sweep over datasets and `efSearch` values.
-- `test_hnsw_rorder_perf.cpp`: HNSW batch-search performance test with perf counter collection.
-- `test_mpmi.cpp`: HNSW-SQ/MPMI evaluation with optional graph reordering and CSV output to `vectors_out/results/hnsw_efs_rorder_sweep.csv`.
-- `test_mpmi_perf.cpp`: MPMI-focused performance test.
-- `test_vec_mpmi_rorder_perf.cpp`: HNSW-SQ/MPMI plus ROrder batch-search performance test.
+- HNSW baseline sweeps over datasets and `efSearch` values.
+- HNSW batch-search performance runs with perf counter collection.
+- HNSW-SQ/MPMI evaluation with optional graph reordering and CSV output under `vectors_out/results`.
+- MPMI-focused performance runs.
+- HNSW-SQ/MPMI batch-search performance runs with graph-layout-aware traversal.
 
-The regular RVANNS unit tests are built when `with_ut=True`/`WITH_UT=ON` is enabled and run through the generated unit-test binary under `tests/ut/`. Faiss tests can be enabled with `with_faiss_tests=True`/`WITH_FAISS_TESTS=ON`. The Python tests live under `tests/python/`, and CI/E2E coverage is described by the Jenkins/Groovy files under `ci/`.
+The regular unit tests are built when `with_ut=True`/`WITH_UT=ON` is enabled and run through the generated unit-test binary under `tests/ut/`. Faiss tests can be enabled with `with_faiss_tests=True`/`WITH_FAISS_TESTS=ON`. The Python tests live under `tests/python/`, and CI/E2E coverage is described by the Jenkins/Groovy files under `ci/`.
 
 ## System Requirements
 
-All Linux distributions are available for RVANNS development. However, the artifact has primarily been exercised on Ubuntu/CentOS-style Linux environments, with additional Mac coverage for both x86_64 and Apple Silicon.
+All Linux distributions are available for development. However, the artifact has primarily been exercised on Ubuntu/CentOS-style Linux environments, with additional Mac coverage for both x86_64 and Apple Silicon.
 
 Here is the verified OS list used by the upstream build configuration:
 
@@ -35,7 +35,7 @@ Here is the verified OS list used by the upstream build configuration:
 - MacOS (x86_64)
 - MacOS (Apple Silicon)
 
-## Building RVANNS From Source Code
+## Building The Artifact From Source Code
 
 #### Install Dependencies
 
@@ -105,14 +105,14 @@ sudo apt install swig python3-dev
 pip3 install bfloat16
 ```
 
-after building RVANNS:
+after building the artifact:
 
 ```bash
 cd python
 python3 setup.py bdist_wheel
 ```
 
-install the generated RVANNS wheel:
+install the generated wheel:
 
 ```bash
 pip3 install dist/*.whl
