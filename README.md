@@ -2,7 +2,7 @@ This document helps reviewers build the RVANNS artifact from source code, unders
 
 ## Introduction
 
-RVANNS is an artifact built on top of Knowhere/Faiss for approximate nearest neighbor search experiments. The repository keeps the upstream C++ vector search library structure, adds HNSW graph reordering support through `IndexHNSW::reorder_graph_after_build`, and provides standalone RVANNS evaluation programs for HNSW, HNSW-SQ/MPMI, and ROrder-style graph layout experiments. The added programs load vector datasets, build or reuse cached indexes, compute or read ground truth, sweep search parameters, and write recall/QPS/latency results into `vectors_out/results`.
+RVANNS is an artifact for approximate nearest neighbor search experiments on vector databases. The repository keeps a C++ vector search engine structure, adds HNSW graph reordering support through `IndexHNSW::reorder_graph_after_build`, and provides standalone RVANNS evaluation programs for HNSW, HNSW-SQ/MPMI, and ROrder-style graph layout experiments. The added programs load vector datasets, build or reuse cached indexes, compute or read ground truth, sweep search parameters, and write recall/QPS/latency results into `vectors_out/results`.
 
 ## Artifact Notes
 
@@ -22,24 +22,20 @@ The RVANNS test programs are:
 - `test_mpmi_perf.cpp`: MPMI-focused performance test.
 - `test_vec_mpmi_rorder_perf.cpp`: HNSW-SQ/MPMI plus ROrder batch-search performance test.
 
-The regular Knowhere unit tests are built when `with_ut=True`/`WITH_UT=ON` is enabled and run through `knowhere_tests`. Faiss tests can be enabled with `with_faiss_tests=True`/`WITH_FAISS_TESTS=ON`. The Python tests live under `tests/python/`, and CI/E2E coverage is described by the Jenkins/Groovy files under `ci/`.
-
-## Building Knowhere Within Milvus
-
-If you wish to only use Knowhere within Milvus without changing any of the Knowhere source code, we suggest that you move to the [Milvus main project](https://github.com/milvus-io/milvus) and build Milvus directly, where Knowhere is then built implicitly during Milvus build.
+The regular RVANNS unit tests are built when `with_ut=True`/`WITH_UT=ON` is enabled and run through the generated unit-test binary under `tests/ut/`. Faiss tests can be enabled with `with_faiss_tests=True`/`WITH_FAISS_TESTS=ON`. The Python tests live under `tests/python/`, and CI/E2E coverage is described by the Jenkins/Groovy files under `ci/`.
 
 ## System Requirements
 
-All Linux distributions are available for Knowhere development. However, a majority of our contributor worked with Ubuntu or CentOS systems, with a small portion of Mac (both x86_64 and Apple Silicon) contributors. If you would like Knowhere to build and run on other distributions, you are more than welcome to file an issue and contribute!
+All Linux distributions are available for RVANNS development. However, the artifact has primarily been exercised on Ubuntu/CentOS-style Linux environments, with additional Mac coverage for both x86_64 and Apple Silicon.
 
-Here's a list of verified OS types where Knowhere can successfully build and run:
+Here is the verified OS list used by the upstream build configuration:
 
 - Ubuntu 20.04 x86_64
 - Ubuntu 20.04 Aarch64
 - MacOS (x86_64)
 - MacOS (Apple Silicon)
 
-## Building Knowhere From Source Code
+## Building RVANNS From Source Code
 
 #### Install Dependencies
 
@@ -89,9 +85,9 @@ conan build ..
 ```bash
 # in build directories
 #Debug
-$ ./Debug/tests/ut/knowhere_tests
+$ ./Debug/tests/ut/*_tests
 #Release
-$ ./Release/tests/ut/knowhere_tests
+$ ./Release/tests/ut/*_tests
 ```
 
 #### Clean up
@@ -100,7 +96,7 @@ $ ./Release/tests/ut/knowhere_tests
 $ git clean -fxd
 ```
 
-## GEN PYTHON WHEEL(NEED REALSE BUILD)
+## GEN PYTHON WHEEL(NEED RELEASE BUILD)
 
 install dependency:
 
@@ -109,17 +105,17 @@ sudo apt install swig python3-dev
 pip3 install bfloat16
 ```
 
-after build knowhere:
+after building RVANNS:
 
 ```bash
 cd python
 python3 setup.py bdist_wheel
 ```
 
-install knowhere wheel:
+install the generated RVANNS wheel:
 
 ```bash
-pip3 install dist/pyknowhere-0.0.0-cp38-cp38-linux_x86_64.whl
+pip3 install dist/*.whl
 ```
 
 clean
@@ -128,9 +124,7 @@ clean
 cd python
 rm -rf build
 rm -rf dist
-rm -rf knowhere.egg-info
-rm knowhere/knowhere_wrap.cpp
-rm knowhere/swigknowhere.py
+rm -rf *.egg-info
 ```
 
 ## Contributing
