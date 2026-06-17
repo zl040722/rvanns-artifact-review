@@ -465,7 +465,7 @@ struct Cli {
     int warmup_rounds = 2;
     int warmup_q = 1000;
 
-    std::string reorder_algo = "gorder";
+    std::string reorder_algo = "rorder";
     bool use_reorder_map = true;
     bool force_rebuild = false;
 

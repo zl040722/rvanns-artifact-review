@@ -6,11 +6,11 @@ This artifact supports approximate nearest neighbor search experiments on vector
 
 ## Artifact Notes
 
-This artifact includes the optimized implementation, patches, and test programs used for evaluation. The SLOC counting policy excludes third-party code under `thirdparty/` and includes tests and build scripts. Under this policy, the artifact contains 57,289 SLOC.
+This artifact includes the optimized implementation, patches, and test programs used for evaluation. The SLOC counting policy excludes third-party code under `thirdparty/` and counts nonblank, non-comment source lines across the released artifact. Under this policy, the artifact contains 58,082 SLOC: 36,373 lines of core implementation code, 18,087 lines of testing and evaluation code, and 3,622 lines of build, configuration, CI, scripts, and artifact metadata.
 
 The main artifact-related files are:
 
-- `thirdparty/faiss/faiss/IndexHNSW.h` and `thirdparty/faiss/faiss/IndexHNSW.cpp`: add post-build graph reordering APIs, keep the `perm[new_id]=old_id` mapping, and support BFS and `gorder` traversal methods.
+- `thirdparty/faiss/faiss/IndexHNSW.h` and `thirdparty/faiss/faiss/IndexHNSW.cpp`: add post-build graph reordering APIs, keep the `perm[new_id]=old_id` mapping, and support BFS and `rorder` traversal methods.
 - `patches/mpmi.patch`: stores the architecture-specific MPMI source patch used to reproduce the corresponding implementation changes.
 - the dedicated evaluation-test directory under `tests/`: contains five standalone C++ test and performance programs, about 3K non-empty source lines in total.
 - `scripts/`, `ci/`, `CMakeLists.txt`, and `conanfile.py`: provide dependency installation, build, coverage, and CI entry points used by the artifact.

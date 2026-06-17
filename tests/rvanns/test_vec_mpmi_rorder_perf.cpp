@@ -438,7 +438,7 @@ struct Cli {
     std::string query_file;
     std::string gt_file;
     std::string index_file;               // 直接指定索引文件
-    std::string reorder_algo = "gorder";  // none or gorder
+    std::string reorder_algo = "rorder";  // none or rorder
     bool use_reorder_map = true;
     int dim = 0;
 
@@ -611,7 +611,7 @@ main(int argc, char** argv) {
         auto cli = parse_cli(argc, argv);
         std::cout << "HNSWSQ/MPMI + ROrder 批查询 Perf测试\n";
         std::cout << "固定参数: efSearch=512, 批查询模式\n";
-        std::cout << "*** 适用于预构建的 HNSWSQ/MPMI 索引；默认执行 --reorder gorder ***\n\n";
+        std::cout << "*** 适用于预构建的 HNSWSQ/MPMI 索引；默认执行 --reorder rorder ***\n\n";
 
         if (cli.dataset == "CUSTOM") {
             if (cli.name.empty())
