@@ -11,6 +11,7 @@ This artifact includes the optimized implementation, patches, and test programs 
 The main artifact-related files are:
 
 - `thirdparty/faiss/faiss/IndexHNSW.h` and `thirdparty/faiss/faiss/IndexHNSW.cpp`: add post-build graph reordering APIs, keep the `perm[new_id]=old_id` mapping, and support BFS and `gorder` traversal methods.
+- `patches/mpmi.patch`: stores the architecture-specific MPMI source patch used to reproduce the corresponding implementation changes.
 - the dedicated evaluation-test directory under `tests/`: contains five standalone C++ test and performance programs, about 3K non-empty source lines in total.
 - `scripts/`, `ci/`, `CMakeLists.txt`, and `conanfile.py`: provide dependency installation, build, coverage, and CI entry points used by the artifact.
 
