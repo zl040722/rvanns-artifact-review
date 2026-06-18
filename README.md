@@ -6,7 +6,7 @@ This artifact supports approximate nearest neighbor search experiments on vector
 
 ## Artifact Notes
 
-This artifact includes the optimized implementation, patches, and test programs used for evaluation. The SLOC counting policy excludes third-party code under `thirdparty/` and counts nonblank, non-comment source lines across the released artifact. Under this policy, the artifact contains 58,082 SLOC: 36,373 lines of core implementation code, 18,087 lines of testing and evaluation code, and 3,622 lines of build, configuration, CI, scripts, and artifact metadata.
+This artifact includes the optimized implementation, patches, and test programs used for evaluation. The SLOC counting policy excludes third-party code under `thirdparty/` and counts nonblank, non-comment source lines across the released artifact. Under this policy, the artifact contains 58,082 SLOC: 54,460 lines of core implementation code, and 3,622 lines of build, configuration, CI, scripts, and artifact metadata.
 
 The main artifact-related files are:
 
