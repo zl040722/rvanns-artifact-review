@@ -81,6 +81,183 @@ size_t round_up_to_cacheline(size_t n) {
     return (n + (kCachelineSize - 1)) & ~(kCachelineSize - 1);
 }
 
+namespace {
+
+bool method_equals(const char* lhs, const char* rhs) {
+    if (lhs == nullptr || rhs == nullptr) {
+        return lhs == rhs;
+    }
+    while (*lhs != '\0' && *rhs != '\0') {
+        if (std::tolower(static_cast<unsigned char>(*lhs)) !=
+            std::tolower(static_cast<unsigned char>(*rhs))) {
+            return false;
+        }
+        ++lhs;
+        ++rhs;
+    }
+    return *lhs == '\0' && *rhs == '\0';
+}
+
+std::vector<std::vector<storage_idx_t>> build_undirected_level0_graph(
+        const HNSW& hnsw,
+        idx_t ntotal) {
+    std::vector<std::vector<storage_idx_t>> graph(ntotal);
+    for (storage_idx_t i = 0; i < ntotal; ++i) {
+        size_t begin = 0;
+        size_t end = 0;
+        hnsw.neighbor_range(i, 0, &begin, &end);
+        for (size_t j = begin; j < end; ++j) {
+            const storage_idx_t neighbor = hnsw.neighbors[j];
+            if (neighbor < 0) {
+                break;
+            }
+            graph[i].push_back(neighbor);
+            if (neighbor != i) {
+                graph[neighbor].push_back(i);
+            }
+        }
+    }
+    for (storage_idx_t i = 0; i < ntotal; ++i) {
+        std::vector<storage_idx_t>& neighbors = graph[i];
+        std::sort(neighbors.begin(), neighbors.end());
+        neighbors.erase(
+                std::unique(neighbors.begin(), neighbors.end()),
+                neighbors.end());
+    }
+    return graph;
+}
+
+storage_idx_t choose_low_degree_seed(
+        const std::vector<std::vector<storage_idx_t>>& graph,
+        const std::vector<uint8_t>& component_visited) {
+    storage_idx_t best = -1;
+    size_t best_degree = std::numeric_limits<size_t>::max();
+    for (storage_idx_t i = 0; i < static_cast<storage_idx_t>(graph.size());
+         ++i) {
+        if (component_visited[i]) {
+            continue;
+        }
+        const size_t degree = graph[i].size();
+        if (best < 0 || degree < best_degree) {
+            best = i;
+            best_degree = degree;
+        }
+    }
+    return best;
+}
+
+storage_idx_t choose_pseudo_peripheral_seed(
+        const std::vector<std::vector<storage_idx_t>>& graph,
+        storage_idx_t start,
+        const std::vector<uint8_t>& component_visited) {
+    if (start < 0) {
+        return start;
+    }
+
+    const storage_idx_t n = static_cast<storage_idx_t>(graph.size());
+    std::vector<int> distance(n, -1);
+    std::queue<storage_idx_t> queue;
+    int previous_eccentricity = -1;
+    storage_idx_t current = start;
+
+    while (true) {
+        std::fill(distance.begin(), distance.end(), -1);
+        while (!queue.empty()) {
+            queue.pop();
+        }
+
+        queue.push(current);
+        distance[current] = 0;
+        int eccentricity = 0;
+        std::vector<storage_idx_t> farthest;
+
+        while (!queue.empty()) {
+            const storage_idx_t node = queue.front();
+            queue.pop();
+            const int node_distance = distance[node];
+            if (node_distance > eccentricity) {
+                eccentricity = node_distance;
+                farthest.clear();
+            }
+            if (node_distance == eccentricity) {
+                farthest.push_back(node);
+            }
+
+            const std::vector<storage_idx_t>& neighbors = graph[node];
+            for (size_t i = 0; i < neighbors.size(); ++i) {
+                const storage_idx_t next = neighbors[i];
+                if (component_visited[next] || distance[next] >= 0) {
+                    continue;
+                }
+                distance[next] = node_distance + 1;
+                queue.push(next);
+            }
+        }
+
+        if (eccentricity <= previous_eccentricity || farthest.empty()) {
+            return current;
+        }
+
+        storage_idx_t next_seed = farthest[0];
+        size_t next_degree = graph[next_seed].size();
+        for (size_t i = 1; i < farthest.size(); ++i) {
+            const storage_idx_t candidate = farthest[i];
+            const size_t degree = graph[candidate].size();
+            if (degree < next_degree) {
+                next_seed = candidate;
+                next_degree = degree;
+            }
+        }
+
+        if (next_seed == current) {
+            return current;
+        }
+
+        previous_eccentricity = eccentricity;
+        current = next_seed;
+    }
+}
+
+struct RabbitCommunity {
+    storage_idx_t parent;
+    std::vector<storage_idx_t> members;
+    double strength;
+    bool active;
+};
+
+storage_idx_t rabbit_find_root(
+        std::vector<RabbitCommunity>& communities,
+        storage_idx_t node) {
+    storage_idx_t root = node;
+    while (communities[root].parent != root) {
+        root = communities[root].parent;
+    }
+    while (communities[node].parent != node) {
+        const storage_idx_t parent = communities[node].parent;
+        communities[node].parent = root;
+        node = parent;
+    }
+    return root;
+}
+
+void rabbit_emit_members(
+        storage_idx_t root,
+        const std::vector<RabbitCommunity>& communities,
+        std::vector<uint8_t>& emitted,
+        std::vector<idx_t>& perm) {
+    const std::vector<storage_idx_t>& members = communities[root].members;
+    for (size_t i = 0; i < members.size(); ++i) {
+        const storage_idx_t member = members[i];
+        if (emitted[member]) {
+            continue;
+        }
+        emitted[member] = 1;
+        perm.push_back(member);
+    }
+}
+
+} // anonymous namespace
+
 struct CacheAlignedBuffer {
     uint8_t* data = nullptr;
     size_t size = 0;
@@ -631,6 +808,9 @@ void IndexHNSW::add(idx_t n, const float* x) {
             storage,
             "Please use IndexHNSWFlat (or variants) instead of IndexHNSW directly");
     FAISS_THROW_IF_NOT(is_trained);
+    FAISS_THROW_IF_NOT_MSG(
+            reorder_perm.empty(),
+            "Cannot add vectors after a post-build HNSW layout pass; reset or rebuild the index first");
     int n0 = ntotal;
     storage->add(n, x);
     ntotal = storage->ntotal;
@@ -950,31 +1130,32 @@ void IndexHNSW::permute_entries(const idx_t* perm) {
     FAISS_THROW_IF_NOT_MSG(
             flat_storage, "don't know how to permute this index");
     invalidate_cacheline_layout();
+
+    auto reorder_node_metadata = [&](std::vector<float>& values) {
+        if (values.size() != (size_t)ntotal)
+            return;
+        std::vector<float> reordered(ntotal);
+        for (idx_t i = 0; i < ntotal; i++) {
+            reordered[i] = values[perm[i]];
+        }
+        values.swap(reordered);
+    };
+
+    reorder_node_metadata(flat_storage->code_norms);
     flat_storage->permute_entries(perm);
     hnsw.permute_entries(perm);
 
-    // Handle Cosine inverse_l2_norms if present
-    auto reorder_inverse_norms = [&](std::vector<float>& norms) {
-        if (norms.size() != (size_t)ntotal)
-            return;
-        std::vector<float> new_norms(ntotal);
-        for (idx_t i = 0; i < ntotal; i++) {
-            new_norms[i] = norms[perm[i]];
-        }
-        norms.swap(new_norms);
-    };
-
     // Check for Cosine variants and reorder their inverse_l2_norms
     if (auto* s = dynamic_cast<IndexFlatCosine*>(storage)) {
-        reorder_inverse_norms(s->inverse_norms_storage.inverse_l2_norms);
+        reorder_node_metadata(s->inverse_norms_storage.inverse_l2_norms);
     } else if (auto* s = dynamic_cast<IndexScalarQuantizerCosine*>(storage)) {
-        reorder_inverse_norms(s->inverse_norms_storage.inverse_l2_norms);
+        reorder_node_metadata(s->inverse_norms_storage.inverse_l2_norms);
     } else if (auto* s = dynamic_cast<IndexPQCosine*>(storage)) {
-        reorder_inverse_norms(s->inverse_norms_storage.inverse_l2_norms);
+        reorder_node_metadata(s->inverse_norms_storage.inverse_l2_norms);
     } else if (
             auto* s = dynamic_cast<IndexProductResidualQuantizerCosine*>(
                     storage)) {
-        reorder_inverse_norms(s->inverse_norms_storage.inverse_l2_norms);
+        reorder_node_metadata(s->inverse_norms_storage.inverse_l2_norms);
     }
 
     if (pending_cacheline_layout_build_) {
@@ -1104,6 +1285,9 @@ void IndexHNSW::reorder_graph_after_build(
         int level,
         const char* method,
         bool freeze) {
+    FAISS_THROW_IF_NOT_MSG(
+            reorder_perm.empty(),
+            "The post-build HNSW layout pass may be applied only once; reset or rebuild the index first");
     if (ntotal == 0 || hnsw.entry_point == -1) {
         return;
     }
@@ -1114,18 +1298,311 @@ void IndexHNSW::reorder_graph_after_build(
     std::vector<idx_t> perm;
     perm.reserve(N);
 
-    if (strcmp(method, "rorder") == 0) {
-        perm = generateRorderPermutation();
-        reorder_perm = perm;
+    if (method_equals(method, "rorder")) {
+        // ROrder uses the same static topology-derived global permutation as
+        // GOrder, then additionally normalizes level-0 adjacency order.
+        perm = generateGorderPermutation();
         this->permute_entries(perm.data());
+        reorder_perm = perm;
 
         if (verbose) {
-            printf("ROrder重排序完成，正在优化neighbors顺序...\n");
+            printf("ROrder global permutation complete; normalizing level-0 adjacency order...\n");
         }
         optimize_neighbors_by_id();
+    } else if (method_equals(method, "gorder")) {
+        perm = generateGorderPermutation();
+        this->permute_entries(perm.data());
+        reorder_perm = perm;
+    } else if (method_equals(method, "rcm")) {
+        perm = generateRCMPermutation();
+        this->permute_entries(perm.data());
+        reorder_perm = perm;
+    } else if (method_equals(method, "rabbitorder")) {
+        perm = generateRabbitOrderPermutation();
+        this->permute_entries(perm.data());
+        reorder_perm = perm;
+    } else if (method_equals(method, "bfs")) {
+        perm = generateBFSPermutation(level);
+        this->permute_entries(perm.data());
+        reorder_perm = perm;
+    } else {
+        FAISS_THROW_FMT(
+                "Unknown HNSW layout method: %s",
+                method ? method : "(null)");
     }
 
     (void)freeze;
+}
+
+std::vector<idx_t> IndexHNSW::generateBFSPermutation(int level) const {
+    const idx_t n = ntotal;
+    std::vector<uint8_t> visited(n, 0);
+    std::vector<idx_t> perm;
+    perm.reserve(n);
+
+    auto bfs_traversal = [&](storage_idx_t start) {
+        if (visited[start]) {
+            return;
+        }
+
+        std::queue<storage_idx_t> queue;
+        queue.push(start);
+        visited[start] = 1;
+        while (!queue.empty()) {
+            const storage_idx_t node = queue.front();
+            queue.pop();
+            perm.push_back(node);
+
+            size_t begin = 0;
+            size_t end = 0;
+            hnsw.neighbor_range(node, level, &begin, &end);
+            for (size_t j = begin; j < end; ++j) {
+                const storage_idx_t neighbor = hnsw.neighbors[j];
+                if (neighbor < 0) {
+                    break;
+                }
+                if (!visited[neighbor]) {
+                    visited[neighbor] = 1;
+                    queue.push(neighbor);
+                }
+            }
+        }
+    };
+
+    bfs_traversal(hnsw.entry_point);
+    for (storage_idx_t i = 0; i < n; ++i) {
+        if (!visited[i]) {
+            bfs_traversal(i);
+        }
+    }
+
+    return perm;
+}
+
+std::vector<idx_t> IndexHNSW::generateRCMPermutation() const {
+    const idx_t n = ntotal;
+    if (n == 0) {
+        return {};
+    }
+
+    const std::vector<std::vector<storage_idx_t>> graph =
+            build_undirected_level0_graph(hnsw, n);
+    std::vector<uint8_t> component_visited(n, 0);
+    std::vector<idx_t> perm;
+    perm.reserve(n);
+
+    std::vector<storage_idx_t> neighbor_buffer;
+    std::vector<storage_idx_t> component_order;
+    std::queue<storage_idx_t> queue;
+
+    while (perm.size() < static_cast<size_t>(n)) {
+        storage_idx_t seed = choose_low_degree_seed(graph, component_visited);
+        if (seed < 0) {
+            break;
+        }
+        seed = choose_pseudo_peripheral_seed(graph, seed, component_visited);
+
+        while (!queue.empty()) {
+            queue.pop();
+        }
+        queue.push(seed);
+        component_visited[seed] = 1;
+        component_order.clear();
+
+        while (!queue.empty()) {
+            const storage_idx_t node = queue.front();
+            queue.pop();
+            component_order.push_back(node);
+
+            neighbor_buffer.clear();
+            const std::vector<storage_idx_t>& neighbors = graph[node];
+            for (size_t i = 0; i < neighbors.size(); ++i) {
+                const storage_idx_t neighbor = neighbors[i];
+                if (!component_visited[neighbor]) {
+                    neighbor_buffer.push_back(neighbor);
+                }
+            }
+
+            std::sort(
+                    neighbor_buffer.begin(),
+                    neighbor_buffer.end(),
+                    [&](storage_idx_t lhs, storage_idx_t rhs) {
+                        const size_t lhs_degree = graph[lhs].size();
+                        const size_t rhs_degree = graph[rhs].size();
+                        if (lhs_degree != rhs_degree) {
+                            return lhs_degree < rhs_degree;
+                        }
+                        return lhs < rhs;
+                    });
+
+            for (size_t i = 0; i < neighbor_buffer.size(); ++i) {
+                const storage_idx_t neighbor = neighbor_buffer[i];
+                if (!component_visited[neighbor]) {
+                    component_visited[neighbor] = 1;
+                    queue.push(neighbor);
+                }
+            }
+        }
+
+        for (std::vector<storage_idx_t>::reverse_iterator it =
+                     component_order.rbegin();
+             it != component_order.rend();
+             ++it) {
+            perm.push_back(*it);
+        }
+    }
+
+    return perm;
+}
+
+std::vector<idx_t> IndexHNSW::generateRabbitOrderPermutation() const {
+    const idx_t n = ntotal;
+    if (n == 0) {
+        return {};
+    }
+
+    const std::vector<std::vector<storage_idx_t>> graph =
+            build_undirected_level0_graph(hnsw, n);
+    std::vector<storage_idx_t> order(n);
+    for (storage_idx_t i = 0; i < n; ++i) {
+        order[i] = i;
+    }
+    std::sort(
+            order.begin(),
+            order.end(),
+            [&](storage_idx_t lhs, storage_idx_t rhs) {
+                const size_t lhs_degree = graph[lhs].size();
+                const size_t rhs_degree = graph[rhs].size();
+                if (lhs_degree != rhs_degree) {
+                    return lhs_degree < rhs_degree;
+                }
+                return lhs < rhs;
+            });
+
+    std::vector<RabbitCommunity> communities(n);
+    double total_edge_weight = 0.0;
+    for (storage_idx_t i = 0; i < n; ++i) {
+        communities[i].parent = i;
+        communities[i].members.push_back(i);
+        communities[i].strength = static_cast<double>(graph[i].size());
+        communities[i].active = true;
+        total_edge_weight += communities[i].strength;
+    }
+    if (total_edge_weight <= 0.0) {
+        total_edge_weight = 1.0;
+    }
+
+    std::vector<double> edge_weights(n, 0.0);
+    std::vector<storage_idx_t> touched_roots;
+    std::vector<uint8_t> root_processed(n, 0);
+
+    for (size_t order_index = 0; order_index < order.size(); ++order_index) {
+        const storage_idx_t node = order[order_index];
+        const storage_idx_t source_root = rabbit_find_root(communities, node);
+        if (!communities[source_root].active || root_processed[source_root]) {
+            continue;
+        }
+        root_processed[source_root] = 1;
+
+        touched_roots.clear();
+        const std::vector<storage_idx_t>& members =
+                communities[source_root].members;
+        for (size_t i = 0; i < members.size(); ++i) {
+            const storage_idx_t member = members[i];
+            const std::vector<storage_idx_t>& neighbors = graph[member];
+            for (size_t j = 0; j < neighbors.size(); ++j) {
+                const storage_idx_t neighbor = neighbors[j];
+                const storage_idx_t neighbor_root =
+                        rabbit_find_root(communities, neighbor);
+                if (neighbor_root == source_root ||
+                    !communities[neighbor_root].active) {
+                    continue;
+                }
+                if (edge_weights[neighbor_root] == 0.0) {
+                    touched_roots.push_back(neighbor_root);
+                }
+                edge_weights[neighbor_root] += 1.0;
+            }
+        }
+
+        storage_idx_t best_root = -1;
+        double best_score = 0.0;
+        for (size_t i = 0; i < touched_roots.size(); ++i) {
+            const storage_idx_t target_root = touched_roots[i];
+            const double edge_weight = edge_weights[target_root];
+            const double score = edge_weight -
+                    (communities[source_root].strength *
+                     communities[target_root].strength) /
+                            total_edge_weight;
+            if (score > best_score ||
+                (score == best_score && best_root >= 0 &&
+                 target_root < best_root)) {
+                best_score = score;
+                best_root = target_root;
+            }
+        }
+
+        if (best_root >= 0 && best_score > 0.0) {
+            communities[source_root].parent = best_root;
+            communities[best_root].members.insert(
+                    communities[best_root].members.end(),
+                    communities[source_root].members.begin(),
+                    communities[source_root].members.end());
+            communities[best_root].strength +=
+                    communities[source_root].strength;
+            communities[source_root].active = false;
+            communities[source_root].members.clear();
+            communities[source_root].strength = 0.0;
+        }
+
+        for (size_t i = 0; i < touched_roots.size(); ++i) {
+            edge_weights[touched_roots[i]] = 0.0;
+        }
+    }
+
+    std::vector<storage_idx_t> roots;
+    roots.reserve(n);
+    for (storage_idx_t i = 0; i < n; ++i) {
+        if (rabbit_find_root(communities, i) == i && communities[i].active) {
+            roots.push_back(i);
+        }
+    }
+
+    std::sort(
+            roots.begin(),
+            roots.end(),
+            [&](storage_idx_t lhs, storage_idx_t rhs) {
+                const double lhs_strength = communities[lhs].strength;
+                const double rhs_strength = communities[rhs].strength;
+                if (lhs_strength != rhs_strength) {
+                    return lhs_strength > rhs_strength;
+                }
+                const storage_idx_t lhs_min = communities[lhs].members.empty()
+                        ? lhs
+                        : *std::min_element(
+                                  communities[lhs].members.begin(),
+                                  communities[lhs].members.end());
+                const storage_idx_t rhs_min = communities[rhs].members.empty()
+                        ? rhs
+                        : *std::min_element(
+                                  communities[rhs].members.begin(),
+                                  communities[rhs].members.end());
+                return lhs_min < rhs_min;
+            });
+
+    std::vector<uint8_t> emitted(n, 0);
+    std::vector<idx_t> perm;
+    perm.reserve(n);
+    for (size_t i = 0; i < roots.size(); ++i) {
+        rabbit_emit_members(roots[i], communities, emitted, perm);
+    }
+    for (storage_idx_t i = 0; i < n; ++i) {
+        if (!emitted[i]) {
+            perm.push_back(i);
+        }
+    }
+
+    return perm;
 }
 
 namespace {
@@ -1239,6 +1716,9 @@ class UnitHeap {
         const int tmptop = top;
         const int key = LinkedList[tmptop].key;
         const int next = LinkedList[tmptop].next;
+        if (next < 0) {
+            return;
+        }
         int p = key;
         const int newkey = key + update[tmptop] - (update[tmptop] / 2);
 
@@ -1341,24 +1821,27 @@ class UnitHeap {
             Header[key].second = prev;
 
         key++;
+        if (static_cast<size_t>(key) >= Header.size()) {
+            Header.resize(static_cast<size_t>(key) + 5);
+        }
         Header[key].second = index;
         if (Header[key].first < 0)
             Header[key].first = index;
         if (LinkedList[top].key < key)
             top = index;
-        if ((size_t)(key + 4) >= Header.size())
-            Header.resize(Header.size() * 1.5);
     }
 };
 
 } // anonymous namespace
 
-std::vector<faiss::idx_t> IndexHNSW::generateRorderPermutation() {
+std::vector<faiss::idx_t> IndexHNSW::generateGorderPermutation() {
     const idx_t N = ntotal;
     const int window = 5;
 
     if (N == 0)
         return {};
+    if (N == 1)
+        return {0};
 
     std::vector<std::vector<int>> out_graph(N);
     std::vector<std::vector<int>> in_graph(N);

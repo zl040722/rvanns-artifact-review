@@ -551,13 +551,20 @@ run_one_dataset(const std::string& name, const std::string& base_file, const std
     std::cout << "索引类型: " << (dynamic_cast<faiss::IndexHNSW*>(index.get()) ? "HNSW" : "Unknown") << "\n";
     std::cout << "向量数量: " << index->ntotal << ", 维度: " << index->d << "\n";
 
+    auto* hnsw_sq = dynamic_cast<faiss::IndexHNSWSQ*>(index.get());
+    auto* sq_storage = hnsw_sq
+            ? dynamic_cast<faiss::IndexScalarQuantizer*>(hnsw_sq->storage)
+            : nullptr;
+    if (!sq_storage ||
+        sq_storage->sq.qtype !=
+                faiss::ScalarQuantizer::QT_HYBRID_FP8_16_32) {
+        throw std::runtime_error(
+                "MPMI benchmark requires QT_HYBRID_FP8_16_32: " +
+                index_file);
+    }
+
     long reorder_ms = 0;
     if (!cli.reorder_algo.empty()) {
-        auto* hnsw_sq = dynamic_cast<faiss::IndexHNSWSQ*>(index.get());
-        if (!hnsw_sq) {
-            throw std::runtime_error("索引类型不是 IndexHNSWSQ，无法执行 ROrder: " + index_file);
-        }
-
         std::cout << "执行内存重排(" << cli.reorder_algo << ")..." << std::flush;
         auto r0 = std::chrono::high_resolution_clock::now();
         hnsw_sq->reorder_graph_after_build(0, cli.reorder_algo.c_str(), true);

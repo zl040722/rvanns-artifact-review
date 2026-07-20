@@ -23,6 +23,7 @@ get_sq_quantizer_type(const std::string& sq_type) {
         {"sq8", faiss::ScalarQuantizer::QT_8bit},
         {"fp16", faiss::ScalarQuantizer::QT_fp16},
         {"bf16", faiss::ScalarQuantizer::QT_bf16},
+        {"mpmi", faiss::ScalarQuantizer::QT_HYBRID_FP8_16_32},
         {"int8", faiss::ScalarQuantizer::QT_8bit_direct_signed}};
 
     // todo: tolower

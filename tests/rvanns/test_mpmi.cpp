@@ -90,7 +90,7 @@ generate_index_cache_filename_hnswsq(const std::string& name, int dim, int nb, i
     ensure_dir(index_cache_dir());
     std::ostringstream oss;
     std::string base_tag = sanitize_tag(basename_of(base_path)) + "_" + std::to_string((long long)file_size(base_path));
-    oss << index_cache_dir() << "/" << name << "_hnswsq_nb" << nb << "_dim" << dim << "_M" << M << "_efC" << efC << "_"
+    oss << index_cache_dir() << "/" << name << "_hnswsq_mpmi_v2_nb" << nb << "_dim" << dim << "_M" << M << "_efC" << efC << "_"
         << metric << "_" << base_tag << ".faiss";
     return oss.str();
 }
@@ -290,7 +290,14 @@ build_or_load_hnswSQ(const std::vector<float>& base, int dim, int nb, int M, int
     load_ms_out = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
     if (index) {
-        if ((int)index->d == dim && (int)index->ntotal == nb && dynamic_cast<faiss::IndexHNSWSQ*>(index.get())) {
+        auto* hnsw_sq = dynamic_cast<faiss::IndexHNSWSQ*>(index.get());
+        auto* sq_storage = hnsw_sq
+                ? dynamic_cast<faiss::IndexScalarQuantizer*>(hnsw_sq->storage)
+                : nullptr;
+        if ((int)index->d == dim && (int)index->ntotal == nb &&
+            sq_storage &&
+            sq_storage->sq.qtype ==
+                    faiss::ScalarQuantizer::QT_HYBRID_FP8_16_32) {
             std::cout << "已加载缓存索引: " << idx_cache << " (" << load_ms_out << " ms), ntotal=" << index->ntotal
                       << "\n";
             return index;
@@ -298,8 +305,9 @@ build_or_load_hnswSQ(const std::vector<float>& base, int dim, int nb, int M, int
         index.reset();
     }
 
-    std::cout << "开始构建 MPMI 索引 (nb=" << nb << ", dim=" << dim << ", M=" << M << ", efC=" << efConstruction
-              << ", SQ=8bit)...\n";
+    std::cout << "Building MPMI index (nb=" << nb << ", dim=" << dim
+              << ", M=" << M << ", efC=" << efConstruction
+              << ", dense affine 8-bit base + FP16/FP32 residuals)...\n";
 
     // 构建
     auto* hnsw = new faiss::IndexHNSWSQ(dim, qtype, M, faiss::METRIC_L2);
@@ -564,7 +572,8 @@ run_one_dataset(const std::string& name, const std::string& base_file, const std
 
     // 构建/加载索引（不含重排）
     long load_ms = 0, build_ms = 0, save_ms = 0, train_ms = 0;
-    auto index = build_or_load_hnswSQ(base, dim, nb, cli.M, cli.efC, faiss::ScalarQuantizer::QT_8bit, name, base_file,
+    auto index = build_or_load_hnswSQ(base, dim, nb, cli.M, cli.efC,
+                                      faiss::ScalarQuantizer::QT_HYBRID_FP8_16_32, name, base_file,
                                       cli.force_rebuild, load_ms, build_ms, save_ms, train_ms);
 
     // 执行重排（如果指定）

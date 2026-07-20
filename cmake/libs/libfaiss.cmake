@@ -272,6 +272,18 @@ if(__RISCV64)
   target_link_libraries(faiss PUBLIC OpenMP::OpenMP_CXX ${BLAS_LIBRARIES}
                                      ${LAPACK_LIBRARIES} knowhere_utils)
   target_compile_definitions(faiss PRIVATE FINTEGER=int)
+  if(DEFINED RVANNS_RVV_DECODE_LMUL)
+    target_compile_definitions(
+      faiss PRIVATE RVANNS_RVV_DECODE_LMUL=${RVANNS_RVV_DECODE_LMUL})
+  endif()
+  if(DEFINED RVANNS_RVV_ACC_LMUL)
+    target_compile_definitions(
+      faiss PRIVATE RVANNS_RVV_ACC_LMUL=${RVANNS_RVV_ACC_LMUL})
+  endif()
+  if(DEFINED RVANNS_RVV_LMUL_TAG)
+    target_compile_definitions(
+      faiss PRIVATE RVANNS_RVV_LMUL_TAG=${RVANNS_RVV_LMUL_TAG})
+  endif()
 endif()
 
 if(__PPC64)

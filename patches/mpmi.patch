@@ -1,5 +1,5 @@
 diff --git a/cmake/libs/libfaiss.cmake b/cmake/libs/libfaiss.cmake
-index c3c45b6c..bfdcf0d7 100644
+index c3c45b6c..16750ef0 100644
 --- a/cmake/libs/libfaiss.cmake
 +++ b/cmake/libs/libfaiss.cmake
 @@ -177,6 +177,9 @@ if(__X86_64)
@@ -31,7 +31,26 @@ index c3c45b6c..bfdcf0d7 100644
              -mabi=lp64d
              -Wno-sign-compare
              -Wno-unused-variable
-@@ -275,6 +281,9 @@ if(__PPC64)
+@@ -266,6 +272,18 @@ if(__RISCV64)
+   target_link_libraries(faiss PUBLIC OpenMP::OpenMP_CXX ${BLAS_LIBRARIES}
+                                      ${LAPACK_LIBRARIES} knowhere_utils)
+   target_compile_definitions(faiss PRIVATE FINTEGER=int)
++  if(DEFINED RVANNS_RVV_DECODE_LMUL)
++    target_compile_definitions(
++      faiss PRIVATE RVANNS_RVV_DECODE_LMUL=${RVANNS_RVV_DECODE_LMUL})
++  endif()
++  if(DEFINED RVANNS_RVV_ACC_LMUL)
++    target_compile_definitions(
++      faiss PRIVATE RVANNS_RVV_ACC_LMUL=${RVANNS_RVV_ACC_LMUL})
++  endif()
++  if(DEFINED RVANNS_RVV_LMUL_TAG)
++    target_compile_definitions(
++      faiss PRIVATE RVANNS_RVV_LMUL_TAG=${RVANNS_RVV_LMUL_TAG})
++  endif()
+ endif()
+ 
+ if(__PPC64)
+@@ -275,6 +293,9 @@ if(__PPC64)
    knowhere_file_glob(GLOB FAISS_NEON_SRCS thirdparty/faiss/faiss/impl/*neon.cpp)
    list(REMOVE_ITEM FAISS_SRCS ${FAISS_NEON_SRCS})
  
@@ -53,15 +72,6 @@ index cf003977..4b34b28f 100644
  namespace faiss {
  
  sq_get_distance_computer_func_ptr sq_get_distance_computer =
-@@ -22,7 +23,7 @@ sq_sel_inv_list_scanner_func_ptr sq_sel_inv_list_scanner =
- sq_get_distance_computer_func_ptr sq_get_hamming_distance_computer =
-         sq_get_hamming_distance_computer_ref;
- 
--// Note: The Jaccard distance computer uses `__builtin_popcount` for 
-+// Note: The Jaccard distance computer uses `__builtin_popcount` for
- // computation. This function is efficiently implemented by the
- // compiler and automatically utilizes the best available instruction set.
- // Therefore, there is no need to manually adjust or hook the Jaccard computer
 @@ -63,6 +64,15 @@ void sq_hook() {
      sq_sel_quantizer = sq_select_quantizer_neon;
      sq_sel_inv_list_scanner = sq_select_inverted_list_scanner_neon;
@@ -78,12 +88,573 @@ index cf003977..4b34b28f 100644
  }
  
  } // namespace faiss
+diff --git a/thirdparty/faiss/faiss/IndexScalarQuantizer.cpp b/thirdparty/faiss/faiss/IndexScalarQuantizer.cpp
+index 75e98040..0e5dfc1e 100644
+--- a/thirdparty/faiss/faiss/IndexScalarQuantizer.cpp
++++ b/thirdparty/faiss/faiss/IndexScalarQuantizer.cpp
+@@ -44,6 +44,7 @@ IndexScalarQuantizer::IndexScalarQuantizer()
+ 
+ void IndexScalarQuantizer::train(idx_t n, const float* x) {
+     sq.train(n, x);
++    code_size = sq.code_size;
+     is_trained = true;
+ }
+ 
+@@ -147,6 +148,8 @@ void IndexIVFScalarQuantizer::train_encoder(
+         const float* x,
+         const idx_t* assign) {
+     sq.train(n, x);
++    code_size = sq.code_size;
++    invlists->code_size = code_size;
+ }
+ 
+ idx_t IndexIVFScalarQuantizer::train_encoder_num_vectors() const {
+diff --git a/thirdparty/faiss/faiss/impl/ScalarQuantizer.cpp b/thirdparty/faiss/faiss/impl/ScalarQuantizer.cpp
+index 77b24c35..c3d8dc1d 100644
+--- a/thirdparty/faiss/faiss/impl/ScalarQuantizer.cpp
++++ b/thirdparty/faiss/faiss/impl/ScalarQuantizer.cpp
+@@ -10,7 +10,11 @@
+ #include <faiss/impl/ScalarQuantizer.h>
+ 
+ #include <algorithm>
++#include <cmath>
++#include <cstdint>
+ #include <cstdio>
++#include <cstring>
++#include <utility>
+ 
+ #include <faiss/impl/platform_macros.h>
+ #include <omp.h>
+@@ -28,6 +32,11 @@
+ #include <faiss/utils/utils.h>
+ 
+ #include <faiss/impl/ScalarQuantizerOp.h>
++#include <faiss/impl/ScalarQuantizerCodec.h>
++
++#if defined(__riscv_vector)
++#include <faiss/impl/ScalarQuantizerDC_rvv.h>
++#endif
+ 
+ namespace faiss {
+ 
+@@ -100,6 +109,12 @@ void ScalarQuantizer::set_derived_sizes() {
+             code_size = (d + 7) / 8;
+             bits = 1;
+             break;
++        case QT_HYBRID_FP8_16_32:
++            bits = 0;
++            code_size = trained.empty()
++                    ? 0
++                    : hybrid_code_size_from_trained(d, trained);
++            break;
+     }
+ }
+ 
+@@ -142,10 +157,130 @@ void ScalarQuantizer::train(size_t n, const float* x) {
+         case QT_1bit_direct:
+             // no training necessary
+             break;
++        case QT_HYBRID_FP8_16_32: {
++            const size_t bitmap_words = (d + 31) / 32;
++            std::vector<float> base_min(d, 0.0f);
++            std::vector<float> base_diff(d, 1.0f);
++
++            if (n != 0) {
++                std::vector<float> affine;
++                train_NonUniform(
++                        rangestat,
++                        rangestat_arg,
++                        n,
++                        d,
++                        256,
++                        x,
++                        affine);
++                FAISS_THROW_IF_NOT_MSG(
++                        affine.size() == 2 * d,
++                        "MPMI affine training returned invalid metadata");
++                std::copy(affine.begin(), affine.begin() + d, base_min.begin());
++                std::copy(affine.begin() + d, affine.end(), base_diff.begin());
++                for (size_t i = 0; i < d; ++i) {
++                    if (!std::isfinite(base_min[i])) {
++                        base_min[i] = 0.0f;
++                    }
++                    if (!std::isfinite(base_diff[i]) || base_diff[i] <= 0.0f) {
++                        base_diff[i] = 0.0f;
++                    }
++                }
++            }
++
++            std::vector<double> residual_sse(d, 0.0);
++            if (n != 0) {
++                for (size_t row = 0; row < n; ++row) {
++                    for (size_t col = 0; col < d; ++col) {
++                        const float value = x[row * d + col];
++                        uint8_t base_code = 0;
++                        if (base_diff[col] > 0.0f) {
++                            float normalized =
++                                    (value - base_min[col]) / base_diff[col];
++                            normalized = std::max(
++                                    0.0f, std::min(1.0f, normalized));
++                            base_code = static_cast<uint8_t>(
++                                    std::lround(normalized * 255.0f));
++                        }
++                        const float reconstructed = base_min[col] +
++                                (static_cast<float>(base_code) / 255.0f) *
++                                        base_diff[col];
++                        const double residual =
++                                static_cast<double>(value) - reconstructed;
++                        residual_sse[col] += residual * residual;
++                    }
++                }
++            }
++
++            std::vector<std::pair<double, size_t>> ranked(d);
++            for (size_t i = 0; i < d; ++i) {
++                ranked[i] = {
++                        n == 0 ? 0.0 : residual_sse[i] / static_cast<double>(n),
++                        i};
++            }
++            std::sort(
++                    ranked.begin(),
++                    ranked.end(),
++                    [](const auto& lhs, const auto& rhs) {
++                        if (lhs.first != rhs.first) {
++                            return lhs.first > rhs.first;
++                        }
++                        return lhs.second < rhs.second;
++                    });
++
++            // The pools are disjoint: the highest-error ceil(1%) use FP32,
++            // and the next ceil(10%) use FP16.
++            size_t fp32_dims = d == 0 || n == 0
++                    ? 0
++                    : static_cast<size_t>(
++                              std::ceil(0.01 * static_cast<double>(d)));
++            size_t fp16_dims = d == 0 || n == 0
++                    ? 0
++                    : static_cast<size_t>(
++                              std::ceil(0.10 * static_cast<double>(d)));
++            fp32_dims = std::min(fp32_dims, d);
++            fp16_dims = std::min(fp16_dims, d - fp32_dims);
++
++            std::vector<uint32_t> fp16_bitmap(bitmap_words, 0);
++            std::vector<uint32_t> fp32_bitmap(bitmap_words, 0);
++            for (size_t rank = 0; rank < fp32_dims; ++rank) {
++                const size_t dim = ranked[rank].second;
++                fp32_bitmap[dim / 32] |= uint32_t(1) << (dim % 32);
++            }
++            for (size_t rank = fp32_dims;
++                 rank < fp32_dims + fp16_dims;
++                 ++rank) {
++                const size_t dim = ranked[rank].second;
++                fp16_bitmap[dim / 32] |= uint32_t(1) << (dim % 32);
++            }
++
++            trained.assign(2 + 2 * d + 2 * bitmap_words, 0.0f);
++            trained[0] = static_cast<float>(bitmap_words);
++            trained[1] = static_cast<float>(bitmap_words);
++            std::copy(base_min.begin(), base_min.end(), trained.begin() + 2);
++            std::copy(
++                    base_diff.begin(),
++                    base_diff.end(),
++                    trained.begin() + 2 + d);
++            if (bitmap_words != 0) {
++                std::memcpy(
++                        trained.data() + 2 + 2 * d,
++                        fp16_bitmap.data(),
++                        bitmap_words * sizeof(uint32_t));
++                std::memcpy(
++                        trained.data() + 2 + 2 * d + bitmap_words,
++                        fp32_bitmap.data(),
++                        bitmap_words * sizeof(uint32_t));
++            }
++            set_derived_sizes();
++            break;
++        }
+     }
+ }
+ 
+ ScalarQuantizer::SQuantizer* ScalarQuantizer::select_quantizer() const {
++    if (qtype == QT_HYBRID_FP8_16_32) {
++        return new QuantizerHybrid(d, trained);
++    }
+     /* use hook to decide use AVX512 or not */
+     return sq_sel_quantizer(qtype, d, trained);
+ }
+@@ -168,11 +303,32 @@ void ScalarQuantizer::decode(const uint8_t* codes, float* x, size_t n) const {
+         squant->decode_vector(codes + i * code_size, x + i * d);
+ }
+ 
++void ScalarQuantizer::decode_portable_hybrid(
++        const uint8_t* codes,
++        float* x,
++        size_t n) const {
++    FAISS_THROW_IF_NOT_MSG(
++            qtype == QT_HYBRID_FP8_16_32,
++            "decode_portable_hybrid requires the MPMI quantizer type");
++    QuantizerHybrid quantizer(d, trained);
++#pragma omp parallel for if (n > 1)
++    for (int64_t i = 0; i < n; ++i) {
++        quantizer.decode_vector(codes + i * code_size, x + i * d);
++    }
++}
++
+ SQDistanceComputer* ScalarQuantizer::get_distance_computer(
+         MetricType metric) const {
+     FAISS_THROW_IF_NOT(
+             metric == METRIC_L2 || metric == METRIC_INNER_PRODUCT ||
+             metric == METRIC_Hamming || metric == METRIC_Jaccard);
++    if (qtype == QT_HYBRID_FP8_16_32) {
++#if defined(__riscv_vector)
++        return sq_get_distance_computer_rvv(metric, qtype, d, trained);
++#else
++        return select_hybrid_distance_computer(metric, d, trained);
++#endif
++    }
+     /* use hook to decide use AVX512 or not */
+     if (metric == METRIC_Hamming) {
+         assert(qtype == QT_1bit_direct);
+@@ -202,6 +358,22 @@ InvertedListScanner* ScalarQuantizer::select_InvertedListScanner(
+         bool store_pairs,
+         const IDSelector* sel,
+         bool by_residual) const {
++    if (qtype == QT_HYBRID_FP8_16_32) {
++#if defined(__riscv_vector)
++        return sq_select_inverted_list_scanner_rvv(
++                mt, this, quantizer, d, store_pairs, sel, by_residual);
++#else
++        if (mt == METRIC_L2) {
++            return sel1_InvertedListScanner<SimilarityL2<1>>(
++                    this, quantizer, store_pairs, sel, by_residual);
++        }
++        if (mt == METRIC_INNER_PRODUCT) {
++            return sel1_InvertedListScanner<SimilarityIP<1>>(
++                    this, quantizer, store_pairs, sel, by_residual);
++        }
++        FAISS_THROW_MSG("MPMI supports only L2 and inner product scanners");
++#endif
++    }
+     /* use hook to decide use AVX512 or not */
+     return sq_sel_inv_list_scanner(mt, this, quantizer, d, store_pairs,
+                                    sel, by_residual);
+diff --git a/thirdparty/faiss/faiss/impl/ScalarQuantizer.h b/thirdparty/faiss/faiss/impl/ScalarQuantizer.h
+index e7df6d6b..996d2fa8 100644
+--- a/thirdparty/faiss/faiss/impl/ScalarQuantizer.h
++++ b/thirdparty/faiss/faiss/impl/ScalarQuantizer.h
+@@ -36,6 +36,7 @@ struct ScalarQuantizer : Quantizer {
+         QT_8bit_direct_signed, ///< fast indexing of signed int8s ranging from
+                                ///< [-128 to 127]
+         QT_1bit_direct, ///< fast indexing of 1 bit per component
++        QT_HYBRID_FP8_16_32, ///< dense 8-bit base with selected FP16/FP32 residuals
+     };
+ 
+     QuantizerType qtype = QT_8bit;
+@@ -83,6 +84,16 @@ struct ScalarQuantizer : Quantizer {
+      */
+     void decode(const uint8_t* code, float* x, size_t n) const override;
+ 
++    /** Decode MPMI payloads through the portable scalar codec.
++     *
++     * This bypasses ISA dispatch and is primarily useful as a correctness
++     * reference for the specialized RVV distance path.
++     */
++    void decode_portable_hybrid(
++            const uint8_t* codes,
++            float* x,
++            size_t n) const;
++
+     /*****************************************************
+      * Objects that provide methods for encoding/decoding, distance
+      * computation and inverted list scanning
+diff --git a/thirdparty/faiss/faiss/impl/ScalarQuantizerCodec.h b/thirdparty/faiss/faiss/impl/ScalarQuantizerCodec.h
+index bd01fb9c..be0021b9 100644
+--- a/thirdparty/faiss/faiss/impl/ScalarQuantizerCodec.h
++++ b/thirdparty/faiss/faiss/impl/ScalarQuantizerCodec.h
+@@ -9,7 +9,11 @@
+ 
+ #include <omp.h>
+ #include <algorithm>
++#include <cmath>
++#include <cstdint>
+ #include <cstdio>
++#include <cstring>
++#include <vector>
+ 
+ #include <faiss/impl/FaissAssert.h>
+ #include <faiss/impl/ScalarQuantizer.h>
+@@ -19,6 +23,7 @@
+ #include <faiss/utils/utils.h>
+ 
+ #include <faiss/impl/ScalarQuantizerScanner.h>
++#include "simd/hook.h"
+ 
+ namespace faiss {
+ 
+@@ -202,6 +207,163 @@ struct QuantizerTemplate<Codec, QuantizerTemplateScaling::NON_UNIFORM, 1> : SQua
+     }
+ };
+ 
++/*******************************************************************
++ * MPMI hybrid quantizer
++ *
++ * Every row starts with a dense unsigned 8-bit affine base. The two
++ * compact pools that follow contain residuals for the dimensions selected
++ * during training. Quantizer-wide affine parameters and selection bitmaps
++ * live in ScalarQuantizer::trained.
++ *******************************************************************/
++
++struct QuantizerHybrid : SQuantizer {
++    const size_t d;
++    const float* vmin = nullptr;
++    const float* vdiff = nullptr;
++    std::vector<uint8_t> fp16_bitmap;
++    std::vector<uint8_t> fp32_bitmap;
++    std::vector<uint32_t> fp16_prefix;
++    std::vector<uint32_t> fp32_prefix;
++    size_t fp16_count = 0;
++    size_t fp32_count = 0;
++    size_t code_size = 0;
++
++    QuantizerHybrid(size_t d, const std::vector<float>& trained) : d(d) {
++        const size_t header_size = 2 + 2 * d;
++        FAISS_THROW_IF_NOT_MSG(
++                trained.size() >= header_size,
++                "MPMI metadata is shorter than its affine header");
++
++        const auto read_word_count = [](float value) -> size_t {
++            FAISS_THROW_IF_NOT_MSG(
++                    std::isfinite(value) && value >= 0.0f &&
++                            std::floor(value) == value,
++                    "MPMI bitmap word count is invalid");
++            return static_cast<size_t>(value);
++        };
++
++        const size_t fp16_words = read_word_count(trained[0]);
++        const size_t fp32_words = read_word_count(trained[1]);
++        const size_t required_words = (d + 31) / 32;
++        FAISS_THROW_IF_NOT_MSG(
++                fp16_words == required_words && fp32_words == required_words,
++                "MPMI bitmap dimensions do not match the quantizer");
++        FAISS_THROW_IF_NOT_MSG(
++                trained.size() >= header_size + fp16_words + fp32_words,
++                "MPMI metadata is shorter than its bitmap payload");
++
++        vmin = trained.data() + 2;
++        vdiff = vmin + d;
++
++        std::vector<uint32_t> fp16_words_data(fp16_words, 0);
++        std::vector<uint32_t> fp32_words_data(fp32_words, 0);
++        if (fp16_words != 0) {
++            std::memcpy(
++                    fp16_words_data.data(),
++                    trained.data() + header_size,
++                    fp16_words * sizeof(uint32_t));
++            std::memcpy(
++                    fp32_words_data.data(),
++                    trained.data() + header_size + fp16_words,
++                    fp32_words * sizeof(uint32_t));
++        }
++
++        fp16_bitmap.resize(d, 0);
++        fp32_bitmap.resize(d, 0);
++        fp16_prefix.resize(d, 0);
++        fp32_prefix.resize(d, 0);
++        for (size_t i = 0; i < d; ++i) {
++            const uint32_t mask = uint32_t(1) << (i % 32);
++            fp16_bitmap[i] =
++                    (fp16_words_data[i / 32] & mask) != 0 ? 1 : 0;
++            fp32_bitmap[i] =
++                    (fp32_words_data[i / 32] & mask) != 0 ? 1 : 0;
++            FAISS_THROW_IF_NOT_MSG(
++                    !(fp16_bitmap[i] && fp32_bitmap[i]),
++                    "MPMI FP16 and FP32 residual pools must be disjoint");
++            fp16_prefix[i] = static_cast<uint32_t>(fp16_count);
++            fp32_prefix[i] = static_cast<uint32_t>(fp32_count);
++            fp16_count += fp16_bitmap[i];
++            fp32_count += fp32_bitmap[i];
++        }
++
++        code_size = d + fp16_count * sizeof(uint16_t) +
++                fp32_count * sizeof(float);
++    }
++
++    FAISS_ALWAYS_INLINE uint8_t encode_base(float value, size_t i) const {
++        if (!(vdiff[i] > 0.0f) || !std::isfinite(vdiff[i])) {
++            return 0;
++        }
++        float normalized = (value - vmin[i]) / vdiff[i];
++        normalized = std::max(0.0f, std::min(1.0f, normalized));
++        return static_cast<uint8_t>(std::lround(normalized * 255.0f));
++    }
++
++    FAISS_ALWAYS_INLINE float decode_base(
++            const uint8_t* code,
++            size_t i) const {
++        if (!(vdiff[i] > 0.0f) || !std::isfinite(vdiff[i])) {
++            return vmin[i];
++        }
++        return vmin[i] + (static_cast<float>(code[i]) / 255.0f) * vdiff[i];
++    }
++
++    FAISS_ALWAYS_INLINE float residual_component(
++            const uint8_t* code,
++            size_t i) const {
++        if (fp16_bitmap[i]) {
++            uint16_t encoded;
++            const size_t offset = d + fp16_prefix[i] * sizeof(uint16_t);
++            std::memcpy(&encoded, code + offset, sizeof(encoded));
++            return decode_fp16(encoded);
++        }
++        if (fp32_bitmap[i]) {
++            float residual;
++            const size_t offset = d + fp16_count * sizeof(uint16_t) +
++                    fp32_prefix[i] * sizeof(float);
++            std::memcpy(&residual, code + offset, sizeof(residual));
++            return residual;
++        }
++        return 0.0f;
++    }
++
++    FAISS_ALWAYS_INLINE float reconstruct_component(
++            const uint8_t* code,
++            size_t i) const {
++        return decode_base(code, i) + residual_component(code, i);
++    }
++
++    void encode_vector(const float* x, uint8_t* code) const final {
++        for (size_t i = 0; i < d; ++i) {
++            const uint8_t base_code = encode_base(x[i], i);
++            code[i] = base_code;
++            const float residual = x[i] - decode_base(code, i);
++            if (fp16_bitmap[i]) {
++                const uint16_t encoded = encode_fp16(residual);
++                const size_t offset = d + fp16_prefix[i] * sizeof(uint16_t);
++                std::memcpy(code + offset, &encoded, sizeof(encoded));
++            } else if (fp32_bitmap[i]) {
++                const size_t offset = d + fp16_count * sizeof(uint16_t) +
++                        fp32_prefix[i] * sizeof(float);
++                std::memcpy(code + offset, &residual, sizeof(residual));
++            }
++        }
++    }
++
++    void decode_vector(const uint8_t* code, float* x) const final {
++        for (size_t i = 0; i < d; ++i) {
++            x[i] = reconstruct_component(code, i);
++        }
++    }
++};
++
++inline size_t hybrid_code_size_from_trained(
++        size_t d,
++        const std::vector<float>& trained) {
++    return QuantizerHybrid(d, trained).code_size;
++}
++
+ /*******************************************************************
+  * FP16 quantizer
+  *******************************************************************/
+@@ -387,6 +549,8 @@ SQuantizer* select_quantizer_1(
+             return new Quantizer8bitDirectSigned<SIMDWIDTH>(d, trained);
+         case ScalarQuantizer::QT_1bit_direct:
+             return new Quantizer1bitDirect(d, trained);
++        case ScalarQuantizer::QT_HYBRID_FP8_16_32:
++            return new QuantizerHybrid(d, trained);
+     }
+     FAISS_THROW_MSG("unknown qtype");
+ }
+@@ -517,6 +681,64 @@ struct DCTemplate<Quantizer, Similarity, 1> : SQDistanceComputer {
+     }
+ };
+ 
++/** Portable MPMI fallback.
++ *
++ * The compact row is reconstructed into distance-computer-local scratch and
++ * then consumed by the platform's existing FP32 distance hook. This keeps the
++ * representation portable without implying that non-RVV backends implement
++ * the RVV-specific fused recovery path.
++ */
++template <class Similarity>
++struct HybridDistanceComputer : SQDistanceComputer {
++    using Sim = Similarity;
++
++    QuantizerHybrid quant;
++    mutable std::vector<float> decoded;
++    mutable std::vector<float> decoded2;
++
++    HybridDistanceComputer(size_t d, const std::vector<float>& trained)
++            : quant(d, trained), decoded(d), decoded2(d) {}
++
++    void set_query(const float* x) final {
++        q = x;
++    }
++
++    float compute_distance(const float* x, const uint8_t* code) const {
++        quant.decode_vector(code, decoded.data());
++        if (Similarity::metric_type == METRIC_L2) {
++            return fvec_L2sqr(x, decoded.data(), quant.d);
++        }
++        return fvec_inner_product(x, decoded.data(), quant.d);
++    }
++
++    float query_to_code(const uint8_t* code) const override final {
++        return compute_distance(q, code);
++    }
++
++    float symmetric_dis(idx_t i, idx_t j) override {
++        quant.decode_vector(codes + i * code_size, decoded.data());
++        quant.decode_vector(codes + j * code_size, decoded2.data());
++        if (Similarity::metric_type == METRIC_L2) {
++            return fvec_L2sqr(decoded.data(), decoded2.data(), quant.d);
++        }
++        return fvec_inner_product(decoded.data(), decoded2.data(), quant.d);
++    }
++};
++
++inline SQDistanceComputer* select_hybrid_distance_computer(
++        MetricType metric,
++        size_t d,
++        const std::vector<float>& trained) {
++    if (metric == METRIC_L2) {
++        return new HybridDistanceComputer<SimilarityL2<1>>(d, trained);
++    }
++    if (metric == METRIC_INNER_PRODUCT) {
++        return new HybridDistanceComputer<SimilarityIP<1>>(d, trained);
++    }
++    FAISS_THROW_MSG("MPMI supports only L2 and inner product distances");
++    return nullptr;
++}
++
+ /*******************************************************************
+  * DistanceComputerByte: computes distances in the integer domain
+  *******************************************************************/
+@@ -633,6 +855,9 @@ SQDistanceComputer* select_distance_computer(
+                     Quantizer8bitDirectSigned<SIMDWIDTH>,
+                     Sim,
+                     SIMDWIDTH>(d, trained);
++
++        case ScalarQuantizer::QT_HYBRID_FP8_16_32:
++            return new HybridDistanceComputer<Sim>(d, trained);
+     }
+     FAISS_THROW_MSG("unknown qtype");
+     return nullptr;
+@@ -787,6 +1012,10 @@ InvertedListScanner* sel1_InvertedListScanner(
+                     Quantizer8bitDirectSigned<SIMDWIDTH>,
+                     Similarity,
+                     SIMDWIDTH>>(sq, quantizer, store_pairs, sel, r);
++        case ScalarQuantizer::QT_HYBRID_FP8_16_32:
++            return sel2_InvertedListScanner<
++                    HybridDistanceComputer<Similarity>>(
++                    sq, quantizer, store_pairs, sel, r);
+     }
+ 
+     FAISS_THROW_MSG("unknown qtype");
 diff --git a/thirdparty/faiss/faiss/impl/ScalarQuantizerCodec_rvv.h b/thirdparty/faiss/faiss/impl/ScalarQuantizerCodec_rvv.h
 new file mode 100644
-index 00000000..b04037a0
+index 00000000..7df32a7f
 --- /dev/null
 +++ b/thirdparty/faiss/faiss/impl/ScalarQuantizerCodec_rvv.h
-@@ -0,0 +1,1339 @@
+@@ -0,0 +1,1722 @@
 +/**
 + * Copyright (c) Facebook, Inc. and its affiliates.
 + *
@@ -99,6 +670,7 @@ index 00000000..b04037a0
 +#include <algorithm>
 +#include <array>
 +#include <cstddef>
++#include <cstring>
 +#include <limits>
 +#include <type_traits>
 +#include <vector>
@@ -109,6 +681,48 @@ index 00000000..b04037a0
 +#include <faiss/utils/utils.h>
 +
 +namespace faiss {
++
++#ifndef RVANNS_RVV_DECODE_LMUL
++#define RVANNS_RVV_DECODE_LMUL 4
++#endif
++
++#ifndef RVANNS_RVV_ACC_LMUL
++#define RVANNS_RVV_ACC_LMUL 2
++#endif
++
++#ifndef RVANNS_RVV_LMUL_TAG
++#define RVANNS_RVV_LMUL_TAG d4a2
++#endif
++
++#define RVANNS_STRINGIFY_INNER(x) #x
++#define RVANNS_STRINGIFY(x) RVANNS_STRINGIFY_INNER(x)
++
++#if RVANNS_RVV_DECODE_LMUL != 0 && RVANNS_RVV_DECODE_LMUL != 1 && \
++        RVANNS_RVV_DECODE_LMUL != 2 && RVANNS_RVV_DECODE_LMUL != 4 && \
++        RVANNS_RVV_DECODE_LMUL != 8
++#error "RVANNS_RVV_DECODE_LMUL must be one of 0, 1, 2, 4, or 8"
++#endif
++
++#if RVANNS_RVV_ACC_LMUL != 0 && RVANNS_RVV_ACC_LMUL != 1 && \
++        RVANNS_RVV_ACC_LMUL != 2 && RVANNS_RVV_ACC_LMUL != 4 && \
++        RVANNS_RVV_ACC_LMUL != 8
++#error "RVANNS_RVV_ACC_LMUL must be one of 0, 1, 2, 4, or 8"
++#endif
++
++inline int rvanns_rvv_decode_lmul() {
++    return RVANNS_RVV_DECODE_LMUL;
++}
++
++inline int rvanns_rvv_acc_lmul() {
++    return RVANNS_RVV_ACC_LMUL;
++}
++
++inline const char* rvanns_rvv_lmul_tag() {
++    return RVANNS_STRINGIFY(RVANNS_RVV_LMUL_TAG);
++}
++
++#undef RVANNS_STRINGIFY
++#undef RVANNS_STRINGIFY_INNER
 +
 +using QuantizerType = ScalarQuantizer::QuantizerType;
 +using RangeStat = ScalarQuantizer::RangeStat;
@@ -433,6 +1047,231 @@ index 00000000..b04037a0
 +    }
 +};
 +
++/*******************************************************************
++ * MPMI RVV recovery
++ *
++ * The dense affine base and packed FP16 residuals are widened with the
++ * configured LMUL. FP32 residuals are applied to the same tile before
++ * distance accumulation.
++ *******************************************************************/
++
++struct QuantizerHybridFP8_rvv : public QuantizerHybrid {
++    static constexpr size_t residual_tile_capacity = 256;
++
++    QuantizerHybridFP8_rvv(size_t d, const std::vector<float>& trained)
++            : QuantizerHybrid(d, trained) {}
++
++    void add_residual_tile(
++            const uint8_t* code,
++            size_t begin,
++            size_t count,
++            float* out) const {
++        if (count == 0) {
++            return;
++        }
++        FAISS_THROW_IF_NOT_MSG(
++                begin <= d && count <= d - begin,
++                "MPMI RVV recovery tile is outside the vector dimension");
++
++#if RVANNS_RVV_DECODE_LMUL == 0
++        for (size_t i = 0; i < count; ++i) {
++            out[i] += residual_component(code, begin + i);
++        }
++#else
++        FAISS_THROW_IF_NOT_MSG(
++                count <= residual_tile_capacity,
++                "MPMI RVV recovery tile exceeds its fixed capacity");
++        static_assert(
++                sizeof(_Float16) == sizeof(uint16_t),
++                "MPMI packed FP16 storage requires a 16-bit _Float16 type");
++
++        const size_t fp16_begin_rank = fp16_prefix[begin];
++        const size_t end = begin + count;
++        const size_t fp16_end_rank =
++                end == d ? fp16_count : fp16_prefix[end];
++        const size_t fp16_tile_count = fp16_end_rank - fp16_begin_rank;
++
++        alignas(64) std::array<_Float16, residual_tile_capacity> packed_fp16;
++        alignas(64) std::array<float, residual_tile_capacity> widened_fp16;
++        if (fp16_tile_count != 0) {
++            const size_t fp16_offset =
++                    d + fp16_begin_rank * sizeof(uint16_t);
++            std::memcpy(
++                    packed_fp16.data(),
++                    code + fp16_offset,
++                    fp16_tile_count * sizeof(uint16_t));
++
++            size_t done = 0;
++#if RVANNS_RVV_DECODE_LMUL == 1
++            while (done < fp16_tile_count) {
++                const size_t vl =
++                        __riscv_vsetvl_e16mf2(fp16_tile_count - done);
++                const vfloat16mf2_t residual16 =
++                        __riscv_vle16_v_f16mf2(packed_fp16.data() + done, vl);
++                const vfloat32m1_t residual32 =
++                        __riscv_vfwcvt_f_f_v_f32m1(residual16, vl);
++                __riscv_vse32_v_f32m1(
++                        widened_fp16.data() + done, residual32, vl);
++                done += vl;
++            }
++#elif RVANNS_RVV_DECODE_LMUL == 2
++            while (done < fp16_tile_count) {
++                const size_t vl =
++                        __riscv_vsetvl_e16m1(fp16_tile_count - done);
++                const vfloat16m1_t residual16 =
++                        __riscv_vle16_v_f16m1(packed_fp16.data() + done, vl);
++                const vfloat32m2_t residual32 =
++                        __riscv_vfwcvt_f_f_v_f32m2(residual16, vl);
++                __riscv_vse32_v_f32m2(
++                        widened_fp16.data() + done, residual32, vl);
++                done += vl;
++            }
++#elif RVANNS_RVV_DECODE_LMUL == 8
++            while (done < fp16_tile_count) {
++                const size_t vl =
++                        __riscv_vsetvl_e16m4(fp16_tile_count - done);
++                const vfloat16m4_t residual16 =
++                        __riscv_vle16_v_f16m4(packed_fp16.data() + done, vl);
++                const vfloat32m8_t residual32 =
++                        __riscv_vfwcvt_f_f_v_f32m8(residual16, vl);
++                __riscv_vse32_v_f32m8(
++                        widened_fp16.data() + done, residual32, vl);
++                done += vl;
++            }
++#else
++            while (done < fp16_tile_count) {
++                const size_t vl =
++                        __riscv_vsetvl_e16m2(fp16_tile_count - done);
++                const vfloat16m2_t residual16 =
++                        __riscv_vle16_v_f16m2(packed_fp16.data() + done, vl);
++                const vfloat32m4_t residual32 =
++                        __riscv_vfwcvt_f_f_v_f32m4(residual16, vl);
++                __riscv_vse32_v_f32m4(
++                        widened_fp16.data() + done, residual32, vl);
++                done += vl;
++            }
++#endif
++
++            size_t packed_index = 0;
++            for (size_t i = 0; i < count; ++i) {
++                if (fp16_bitmap[begin + i]) {
++                    out[i] += widened_fp16[packed_index++];
++                }
++            }
++            FAISS_THROW_IF_NOT(packed_index == fp16_tile_count);
++        }
++
++        const size_t fp32_pool_offset =
++                d + fp16_count * sizeof(uint16_t);
++        for (size_t i = 0; i < count; ++i) {
++            const size_t dimension = begin + i;
++            if (fp32_bitmap[dimension]) {
++                float residual;
++                const size_t offset = fp32_pool_offset +
++                        fp32_prefix[dimension] * sizeof(float);
++                std::memcpy(&residual, code + offset, sizeof(residual));
++                out[i] += residual;
++            }
++        }
++#endif
++    }
++
++    void decode_tile(
++            const uint8_t* code,
++            size_t begin,
++            size_t count,
++            float* out) const {
++#if RVANNS_RVV_DECODE_LMUL == 0
++        for (size_t i = 0; i < count; ++i) {
++            out[i] = decode_base(code, begin + i);
++        }
++#elif RVANNS_RVV_DECODE_LMUL == 1
++        size_t done = 0;
++        while (done < count) {
++            const size_t vl = __riscv_vsetvl_e32m1(count - done);
++            const size_t offset = begin + done;
++            const vuint8mf4_t q8 = __riscv_vle8_v_u8mf4(code + offset, vl);
++            const vuint16mf2_t q16 =
++                    __riscv_vwcvtu_x_x_v_u16mf2(q8, vl);
++            const vuint32m1_t q32 = __riscv_vwcvtu_x_x_v_u32m1(q16, vl);
++            const vfloat32m1_t qf = __riscv_vfcvt_f_xu_v_f32m1(q32, vl);
++            const vfloat32m1_t normalized =
++                    __riscv_vfmul_vf_f32m1(qf, 1.0f / 255.0f, vl);
++            const vfloat32m1_t mins =
++                    __riscv_vle32_v_f32m1(vmin + offset, vl);
++            const vfloat32m1_t diffs =
++                    __riscv_vle32_v_f32m1(vdiff + offset, vl);
++            const vfloat32m1_t base = __riscv_vfmadd_vv_f32m1(
++                    normalized, diffs, mins, vl);
++            __riscv_vse32_v_f32m1(out + done, base, vl);
++            done += vl;
++        }
++#elif RVANNS_RVV_DECODE_LMUL == 2
++        size_t done = 0;
++        while (done < count) {
++            const size_t vl = __riscv_vsetvl_e32m2(count - done);
++            const size_t offset = begin + done;
++            const vuint8mf2_t q8 = __riscv_vle8_v_u8mf2(code + offset, vl);
++            const vuint16m1_t q16 = __riscv_vwcvtu_x_x_v_u16m1(q8, vl);
++            const vuint32m2_t q32 = __riscv_vwcvtu_x_x_v_u32m2(q16, vl);
++            const vfloat32m2_t qf = __riscv_vfcvt_f_xu_v_f32m2(q32, vl);
++            const vfloat32m2_t normalized =
++                    __riscv_vfmul_vf_f32m2(qf, 1.0f / 255.0f, vl);
++            const vfloat32m2_t mins =
++                    __riscv_vle32_v_f32m2(vmin + offset, vl);
++            const vfloat32m2_t diffs =
++                    __riscv_vle32_v_f32m2(vdiff + offset, vl);
++            const vfloat32m2_t base = __riscv_vfmadd_vv_f32m2(
++                    normalized, diffs, mins, vl);
++            __riscv_vse32_v_f32m2(out + done, base, vl);
++            done += vl;
++        }
++#elif RVANNS_RVV_DECODE_LMUL == 8
++        size_t done = 0;
++        while (done < count) {
++            const size_t vl = __riscv_vsetvl_e32m8(count - done);
++            const size_t offset = begin + done;
++            const vuint8m2_t q8 = __riscv_vle8_v_u8m2(code + offset, vl);
++            const vuint16m4_t q16 = __riscv_vwcvtu_x_x_v_u16m4(q8, vl);
++            const vuint32m8_t q32 = __riscv_vwcvtu_x_x_v_u32m8(q16, vl);
++            const vfloat32m8_t qf = __riscv_vfcvt_f_xu_v_f32m8(q32, vl);
++            const vfloat32m8_t normalized =
++                    __riscv_vfmul_vf_f32m8(qf, 1.0f / 255.0f, vl);
++            const vfloat32m8_t mins =
++                    __riscv_vle32_v_f32m8(vmin + offset, vl);
++            const vfloat32m8_t diffs =
++                    __riscv_vle32_v_f32m8(vdiff + offset, vl);
++            const vfloat32m8_t base = __riscv_vfmadd_vv_f32m8(
++                    normalized, diffs, mins, vl);
++            __riscv_vse32_v_f32m8(out + done, base, vl);
++            done += vl;
++        }
++#else
++        size_t done = 0;
++        while (done < count) {
++            const size_t vl = __riscv_vsetvl_e32m4(count - done);
++            const size_t offset = begin + done;
++            const vuint8m1_t q8 = __riscv_vle8_v_u8m1(code + offset, vl);
++            const vuint16m2_t q16 = __riscv_vwcvtu_x_x_v_u16m2(q8, vl);
++            const vuint32m4_t q32 = __riscv_vwcvtu_x_x_v_u32m4(q16, vl);
++            const vfloat32m4_t qf = __riscv_vfcvt_f_xu_v_f32m4(q32, vl);
++            const vfloat32m4_t normalized =
++                    __riscv_vfmul_vf_f32m4(qf, 1.0f / 255.0f, vl);
++            const vfloat32m4_t mins =
++                    __riscv_vle32_v_f32m4(vmin + offset, vl);
++            const vfloat32m4_t diffs =
++                    __riscv_vle32_v_f32m4(vdiff + offset, vl);
++            const vfloat32m4_t base = __riscv_vfmadd_vv_f32m4(
++                    normalized, diffs, mins, vl);
++            __riscv_vse32_v_f32m4(out + done, base, vl);
++            done += vl;
++        }
++#endif
++
++        add_residual_tile(code, begin, count, out);
++    }
++};
++
 +template <int SIMDWIDTH>
 +ScalarQuantizer::SQuantizer* select_quantizer_1_rvv(
 +        ScalarQuantizer::QuantizerType qtype,
@@ -472,6 +1311,8 @@ index 00000000..b04037a0
 +            return new Quantizer8bitDirect_rvv<SIMDWIDTH>(dim, trained);
 +        case ScalarQuantizer::QT_8bit_direct_signed:
 +            return new Quantizer8bitDirectSigned_rvv<SIMDWIDTH>(dim, trained);
++        case ScalarQuantizer::QT_HYBRID_FP8_16_32:
++            return new QuantizerHybridFP8_rvv(dim, trained);
 +        default:
 +            FAISS_THROW_FMT("Quantizer type %d not supported", qtype);
 +    }
@@ -1126,6 +1967,111 @@ index 00000000..b04037a0
 +};
 +FAISS_PRAGMA_IMPRECISE_FUNCTION_END
 +
++#define RVANNS_HYBRID_ACCUMULATE(LMUL)                                \
++    do {                                                              \
++        size_t offset = 0;                                            \
++        while (offset < count) {                                      \
++            const size_t vl =                                         \
++                    __riscv_vsetvl_e32##LMUL(count - offset);         \
++            const vfloat32##LMUL##_t lhs =                            \
++                    __riscv_vle32_v_f32##LMUL(a + offset, vl);        \
++            const vfloat32##LMUL##_t rhs =                            \
++                    __riscv_vle32_v_f32##LMUL(b + offset, vl);        \
++            vfloat32##LMUL##_t sum =                                  \
++                    __riscv_vfmv_v_f_f32##LMUL(0.0f, vl);            \
++            if constexpr (Similarity::metric_type == METRIC_L2) {     \
++                const vfloat32##LMUL##_t diff =                        \
++                        __riscv_vfsub_vv_f32##LMUL(lhs, rhs, vl);     \
++                sum = __riscv_vfmacc_vv_f32##LMUL(                   \
++                        sum, diff, diff, vl);                          \
++            } else {                                                  \
++                sum = __riscv_vfmacc_vv_f32##LMUL(                   \
++                        sum, lhs, rhs, vl);                            \
++            }                                                         \
++            vfloat32m1_t zero = __riscv_vfmv_v_f_f32m1(0.0f, 1);    \
++            const vfloat32m1_t reduced =                              \
++                    __riscv_vfredusum_vs_f32##LMUL##_f32m1(          \
++                            sum, zero, vl);                            \
++            total += __riscv_vfmv_f_s_f32m1_f32(reduced);           \
++            offset += vl;                                             \
++        }                                                             \
++    } while (false)
++
++template <class Similarity>
++struct HybridDistanceComputer_rvv : SQDistanceComputer {
++    using Sim = Similarity;
++    static constexpr size_t tile_size = 256;
++
++    QuantizerHybridFP8_rvv quant;
++    mutable std::array<float, tile_size> decoded;
++    mutable std::array<float, tile_size> decoded2;
++
++    HybridDistanceComputer_rvv(
++            size_t d,
++            const std::vector<float>& trained)
++            : quant(d, trained) {}
++
++    void set_query(const float* x) final {
++        q = x;
++    }
++
++    float accumulate_tile(
++            const float* a,
++            const float* b,
++            size_t count) const {
++        float total = 0.0f;
++#if RVANNS_RVV_ACC_LMUL == 0
++        for (size_t i = 0; i < count; ++i) {
++            if constexpr (Similarity::metric_type == METRIC_L2) {
++                const float diff = a[i] - b[i];
++                total += diff * diff;
++            } else {
++                total += a[i] * b[i];
++            }
++        }
++#elif RVANNS_RVV_ACC_LMUL == 1
++        RVANNS_HYBRID_ACCUMULATE(m1);
++#elif RVANNS_RVV_ACC_LMUL == 2
++        RVANNS_HYBRID_ACCUMULATE(m2);
++#elif RVANNS_RVV_ACC_LMUL == 4
++        RVANNS_HYBRID_ACCUMULATE(m4);
++#else
++        RVANNS_HYBRID_ACCUMULATE(m8);
++#endif
++        return total;
++    }
++
++    float compute_distance(const float* x, const uint8_t* code) const {
++        float total = 0.0f;
++        for (size_t begin = 0; begin < quant.d; begin += tile_size) {
++            const size_t count = std::min(tile_size, quant.d - begin);
++            quant.decode_tile(code, begin, count, decoded.data());
++            total += accumulate_tile(x + begin, decoded.data(), count);
++        }
++        return total;
++    }
++
++    float query_to_code(const uint8_t* code) const override final {
++        return compute_distance(q, code);
++    }
++
++    float symmetric_dis(idx_t i, idx_t j) override {
++        const uint8_t* code_i = codes + i * code_size;
++        const uint8_t* code_j = codes + j * code_size;
++        float total = 0.0f;
++        for (size_t begin = 0; begin < quant.d; begin += tile_size) {
++            const size_t count = std::min(tile_size, quant.d - begin);
++            quant.decode_tile(code_i, begin, count, decoded.data());
++            quant.decode_tile(code_j, begin, count, decoded2.data());
++            total += accumulate_tile(
++                    decoded.data(), decoded2.data(), count);
++        }
++        return total;
++    }
++};
++
++#undef RVANNS_HYBRID_ACCUMULATE
++
 +/*******************************************************************
 + * DistanceComputerByte: computes distances in the integer domain
 + *******************************************************************/
@@ -1288,6 +2234,9 @@ index 00000000..b04037a0
 +                    Similarity,
 +                    0>(dim, trained);
 +
++        case ScalarQuantizer::QT_HYBRID_FP8_16_32:
++            return new HybridDistanceComputer_rvv<Similarity>(dim, trained);
++
 +        default:
 +            FAISS_THROW_FMT("Quantizer type %d not supported", qtype);
 +            return nullptr;
@@ -1393,6 +2342,11 @@ index 00000000..b04037a0
 +                    Quantizer8bitDirectSigned_rvv<SIMDWIDTH>,
 +                    Similarity,
 +                    SIMDWIDTH>>(sq, quantizer, store_pairs, sel, r);
++
++        case QuantizerType::QT_HYBRID_FP8_16_32:
++            return sel2_InvertedListScanner_rvv<
++                    HybridDistanceComputer_rvv<Similarity>>(
++                    sq, quantizer, store_pairs, sel, r);
 +
 +        default:
 +            FAISS_THROW_MSG("unknown qtype");

@@ -36,6 +36,7 @@ struct ScalarQuantizer : Quantizer {
         QT_8bit_direct_signed, ///< fast indexing of signed int8s ranging from
                                ///< [-128 to 127]
         QT_1bit_direct, ///< fast indexing of 1 bit per component
+        QT_HYBRID_FP8_16_32, ///< dense 8-bit base with selected FP16/FP32 residuals
     };
 
     QuantizerType qtype = QT_8bit;
@@ -82,6 +83,16 @@ struct ScalarQuantizer : Quantizer {
      * @param x      output vectors, size n * d
      */
     void decode(const uint8_t* code, float* x, size_t n) const override;
+
+    /** Decode MPMI payloads through the portable scalar codec.
+     *
+     * This bypasses ISA dispatch and is primarily useful as a correctness
+     * reference for the specialized RVV distance path.
+     */
+    void decode_portable_hybrid(
+            const uint8_t* codes,
+            float* x,
+            size_t n) const;
 
     /*****************************************************
      * Objects that provide methods for encoding/decoding, distance

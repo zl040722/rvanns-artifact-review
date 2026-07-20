@@ -195,6 +195,7 @@ constexpr const char* VECTORS_BEAMWIDTH = "vectors_beamwidth";
 constexpr const char* HNSW_REFINE = "refine";
 constexpr const char* HNSW_REFINE_K = "refine_k";
 constexpr const char* HNSW_REFINE_TYPE = "refine_type";
+constexpr const char* HNSW_GRAPH_LAYOUT = "graph_layout";
 constexpr const char* SQ_TYPE = "sq_type";  // for IVF_SQ and HNSW_SQ
 constexpr const char* PRQ_NUM = "nrq";      // for PRQ, number of redisual quantizers
 

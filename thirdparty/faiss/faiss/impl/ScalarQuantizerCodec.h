@@ -9,7 +9,11 @@
 
 #include <omp.h>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 #include <faiss/impl/FaissAssert.h>
 #include <faiss/impl/ScalarQuantizer.h>
@@ -19,6 +23,7 @@
 #include <faiss/utils/utils.h>
 
 #include <faiss/impl/ScalarQuantizerScanner.h>
+#include "simd/hook.h"
 
 namespace faiss {
 
@@ -201,6 +206,163 @@ struct QuantizerTemplate<Codec, QuantizerTemplateScaling::NON_UNIFORM, 1> : SQua
         return vmin[i] + xi * vdiff[i];
     }
 };
+
+/*******************************************************************
+ * MPMI hybrid quantizer
+ *
+ * Every row starts with a dense unsigned 8-bit affine base. The two
+ * compact pools that follow contain residuals for the dimensions selected
+ * during training. Quantizer-wide affine parameters and selection bitmaps
+ * live in ScalarQuantizer::trained.
+ *******************************************************************/
+
+struct QuantizerHybrid : SQuantizer {
+    const size_t d;
+    const float* vmin = nullptr;
+    const float* vdiff = nullptr;
+    std::vector<uint8_t> fp16_bitmap;
+    std::vector<uint8_t> fp32_bitmap;
+    std::vector<uint32_t> fp16_prefix;
+    std::vector<uint32_t> fp32_prefix;
+    size_t fp16_count = 0;
+    size_t fp32_count = 0;
+    size_t code_size = 0;
+
+    QuantizerHybrid(size_t d, const std::vector<float>& trained) : d(d) {
+        const size_t header_size = 2 + 2 * d;
+        FAISS_THROW_IF_NOT_MSG(
+                trained.size() >= header_size,
+                "MPMI metadata is shorter than its affine header");
+
+        const auto read_word_count = [](float value) -> size_t {
+            FAISS_THROW_IF_NOT_MSG(
+                    std::isfinite(value) && value >= 0.0f &&
+                            std::floor(value) == value,
+                    "MPMI bitmap word count is invalid");
+            return static_cast<size_t>(value);
+        };
+
+        const size_t fp16_words = read_word_count(trained[0]);
+        const size_t fp32_words = read_word_count(trained[1]);
+        const size_t required_words = (d + 31) / 32;
+        FAISS_THROW_IF_NOT_MSG(
+                fp16_words == required_words && fp32_words == required_words,
+                "MPMI bitmap dimensions do not match the quantizer");
+        FAISS_THROW_IF_NOT_MSG(
+                trained.size() >= header_size + fp16_words + fp32_words,
+                "MPMI metadata is shorter than its bitmap payload");
+
+        vmin = trained.data() + 2;
+        vdiff = vmin + d;
+
+        std::vector<uint32_t> fp16_words_data(fp16_words, 0);
+        std::vector<uint32_t> fp32_words_data(fp32_words, 0);
+        if (fp16_words != 0) {
+            std::memcpy(
+                    fp16_words_data.data(),
+                    trained.data() + header_size,
+                    fp16_words * sizeof(uint32_t));
+            std::memcpy(
+                    fp32_words_data.data(),
+                    trained.data() + header_size + fp16_words,
+                    fp32_words * sizeof(uint32_t));
+        }
+
+        fp16_bitmap.resize(d, 0);
+        fp32_bitmap.resize(d, 0);
+        fp16_prefix.resize(d, 0);
+        fp32_prefix.resize(d, 0);
+        for (size_t i = 0; i < d; ++i) {
+            const uint32_t mask = uint32_t(1) << (i % 32);
+            fp16_bitmap[i] =
+                    (fp16_words_data[i / 32] & mask) != 0 ? 1 : 0;
+            fp32_bitmap[i] =
+                    (fp32_words_data[i / 32] & mask) != 0 ? 1 : 0;
+            FAISS_THROW_IF_NOT_MSG(
+                    !(fp16_bitmap[i] && fp32_bitmap[i]),
+                    "MPMI FP16 and FP32 residual pools must be disjoint");
+            fp16_prefix[i] = static_cast<uint32_t>(fp16_count);
+            fp32_prefix[i] = static_cast<uint32_t>(fp32_count);
+            fp16_count += fp16_bitmap[i];
+            fp32_count += fp32_bitmap[i];
+        }
+
+        code_size = d + fp16_count * sizeof(uint16_t) +
+                fp32_count * sizeof(float);
+    }
+
+    FAISS_ALWAYS_INLINE uint8_t encode_base(float value, size_t i) const {
+        if (!(vdiff[i] > 0.0f) || !std::isfinite(vdiff[i])) {
+            return 0;
+        }
+        float normalized = (value - vmin[i]) / vdiff[i];
+        normalized = std::max(0.0f, std::min(1.0f, normalized));
+        return static_cast<uint8_t>(std::lround(normalized * 255.0f));
+    }
+
+    FAISS_ALWAYS_INLINE float decode_base(
+            const uint8_t* code,
+            size_t i) const {
+        if (!(vdiff[i] > 0.0f) || !std::isfinite(vdiff[i])) {
+            return vmin[i];
+        }
+        return vmin[i] + (static_cast<float>(code[i]) / 255.0f) * vdiff[i];
+    }
+
+    FAISS_ALWAYS_INLINE float residual_component(
+            const uint8_t* code,
+            size_t i) const {
+        if (fp16_bitmap[i]) {
+            uint16_t encoded;
+            const size_t offset = d + fp16_prefix[i] * sizeof(uint16_t);
+            std::memcpy(&encoded, code + offset, sizeof(encoded));
+            return decode_fp16(encoded);
+        }
+        if (fp32_bitmap[i]) {
+            float residual;
+            const size_t offset = d + fp16_count * sizeof(uint16_t) +
+                    fp32_prefix[i] * sizeof(float);
+            std::memcpy(&residual, code + offset, sizeof(residual));
+            return residual;
+        }
+        return 0.0f;
+    }
+
+    FAISS_ALWAYS_INLINE float reconstruct_component(
+            const uint8_t* code,
+            size_t i) const {
+        return decode_base(code, i) + residual_component(code, i);
+    }
+
+    void encode_vector(const float* x, uint8_t* code) const final {
+        for (size_t i = 0; i < d; ++i) {
+            const uint8_t base_code = encode_base(x[i], i);
+            code[i] = base_code;
+            const float residual = x[i] - decode_base(code, i);
+            if (fp16_bitmap[i]) {
+                const uint16_t encoded = encode_fp16(residual);
+                const size_t offset = d + fp16_prefix[i] * sizeof(uint16_t);
+                std::memcpy(code + offset, &encoded, sizeof(encoded));
+            } else if (fp32_bitmap[i]) {
+                const size_t offset = d + fp16_count * sizeof(uint16_t) +
+                        fp32_prefix[i] * sizeof(float);
+                std::memcpy(code + offset, &residual, sizeof(residual));
+            }
+        }
+    }
+
+    void decode_vector(const uint8_t* code, float* x) const final {
+        for (size_t i = 0; i < d; ++i) {
+            x[i] = reconstruct_component(code, i);
+        }
+    }
+};
+
+inline size_t hybrid_code_size_from_trained(
+        size_t d,
+        const std::vector<float>& trained) {
+    return QuantizerHybrid(d, trained).code_size;
+}
 
 /*******************************************************************
  * FP16 quantizer
@@ -387,6 +549,8 @@ SQuantizer* select_quantizer_1(
             return new Quantizer8bitDirectSigned<SIMDWIDTH>(d, trained);
         case ScalarQuantizer::QT_1bit_direct:
             return new Quantizer1bitDirect(d, trained);
+        case ScalarQuantizer::QT_HYBRID_FP8_16_32:
+            return new QuantizerHybrid(d, trained);
     }
     FAISS_THROW_MSG("unknown qtype");
 }
@@ -517,6 +681,64 @@ struct DCTemplate<Quantizer, Similarity, 1> : SQDistanceComputer {
     }
 };
 
+/** Portable MPMI fallback.
+ *
+ * The compact row is reconstructed into distance-computer-local scratch and
+ * then consumed by the platform's existing FP32 distance hook. This keeps the
+ * representation portable without implying that non-RVV backends implement
+ * the RVV-specific fused recovery path.
+ */
+template <class Similarity>
+struct HybridDistanceComputer : SQDistanceComputer {
+    using Sim = Similarity;
+
+    QuantizerHybrid quant;
+    mutable std::vector<float> decoded;
+    mutable std::vector<float> decoded2;
+
+    HybridDistanceComputer(size_t d, const std::vector<float>& trained)
+            : quant(d, trained), decoded(d), decoded2(d) {}
+
+    void set_query(const float* x) final {
+        q = x;
+    }
+
+    float compute_distance(const float* x, const uint8_t* code) const {
+        quant.decode_vector(code, decoded.data());
+        if (Similarity::metric_type == METRIC_L2) {
+            return fvec_L2sqr(x, decoded.data(), quant.d);
+        }
+        return fvec_inner_product(x, decoded.data(), quant.d);
+    }
+
+    float query_to_code(const uint8_t* code) const override final {
+        return compute_distance(q, code);
+    }
+
+    float symmetric_dis(idx_t i, idx_t j) override {
+        quant.decode_vector(codes + i * code_size, decoded.data());
+        quant.decode_vector(codes + j * code_size, decoded2.data());
+        if (Similarity::metric_type == METRIC_L2) {
+            return fvec_L2sqr(decoded.data(), decoded2.data(), quant.d);
+        }
+        return fvec_inner_product(decoded.data(), decoded2.data(), quant.d);
+    }
+};
+
+inline SQDistanceComputer* select_hybrid_distance_computer(
+        MetricType metric,
+        size_t d,
+        const std::vector<float>& trained) {
+    if (metric == METRIC_L2) {
+        return new HybridDistanceComputer<SimilarityL2<1>>(d, trained);
+    }
+    if (metric == METRIC_INNER_PRODUCT) {
+        return new HybridDistanceComputer<SimilarityIP<1>>(d, trained);
+    }
+    FAISS_THROW_MSG("MPMI supports only L2 and inner product distances");
+    return nullptr;
+}
+
 /*******************************************************************
  * DistanceComputerByte: computes distances in the integer domain
  *******************************************************************/
@@ -633,6 +855,9 @@ SQDistanceComputer* select_distance_computer(
                     Quantizer8bitDirectSigned<SIMDWIDTH>,
                     Sim,
                     SIMDWIDTH>(d, trained);
+
+        case ScalarQuantizer::QT_HYBRID_FP8_16_32:
+            return new HybridDistanceComputer<Sim>(d, trained);
     }
     FAISS_THROW_MSG("unknown qtype");
     return nullptr;
@@ -787,6 +1012,10 @@ InvertedListScanner* sel1_InvertedListScanner(
                     Quantizer8bitDirectSigned<SIMDWIDTH>,
                     Similarity,
                     SIMDWIDTH>>(sq, quantizer, store_pairs, sel, r);
+        case ScalarQuantizer::QT_HYBRID_FP8_16_32:
+            return sel2_InvertedListScanner<
+                    HybridDistanceComputer<Similarity>>(
+                    sq, quantizer, store_pairs, sel, r);
     }
 
     FAISS_THROW_MSG("unknown qtype");

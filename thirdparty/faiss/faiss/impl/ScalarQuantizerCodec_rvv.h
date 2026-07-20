@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 #include <vector>
@@ -23,6 +24,48 @@
 #include <faiss/utils/utils.h>
 
 namespace faiss {
+
+#ifndef RVANNS_RVV_DECODE_LMUL
+#define RVANNS_RVV_DECODE_LMUL 4
+#endif
+
+#ifndef RVANNS_RVV_ACC_LMUL
+#define RVANNS_RVV_ACC_LMUL 2
+#endif
+
+#ifndef RVANNS_RVV_LMUL_TAG
+#define RVANNS_RVV_LMUL_TAG d4a2
+#endif
+
+#define RVANNS_STRINGIFY_INNER(x) #x
+#define RVANNS_STRINGIFY(x) RVANNS_STRINGIFY_INNER(x)
+
+#if RVANNS_RVV_DECODE_LMUL != 0 && RVANNS_RVV_DECODE_LMUL != 1 && \
+        RVANNS_RVV_DECODE_LMUL != 2 && RVANNS_RVV_DECODE_LMUL != 4 && \
+        RVANNS_RVV_DECODE_LMUL != 8
+#error "RVANNS_RVV_DECODE_LMUL must be one of 0, 1, 2, 4, or 8"
+#endif
+
+#if RVANNS_RVV_ACC_LMUL != 0 && RVANNS_RVV_ACC_LMUL != 1 && \
+        RVANNS_RVV_ACC_LMUL != 2 && RVANNS_RVV_ACC_LMUL != 4 && \
+        RVANNS_RVV_ACC_LMUL != 8
+#error "RVANNS_RVV_ACC_LMUL must be one of 0, 1, 2, 4, or 8"
+#endif
+
+inline int rvanns_rvv_decode_lmul() {
+    return RVANNS_RVV_DECODE_LMUL;
+}
+
+inline int rvanns_rvv_acc_lmul() {
+    return RVANNS_RVV_ACC_LMUL;
+}
+
+inline const char* rvanns_rvv_lmul_tag() {
+    return RVANNS_STRINGIFY(RVANNS_RVV_LMUL_TAG);
+}
+
+#undef RVANNS_STRINGIFY
+#undef RVANNS_STRINGIFY_INNER
 
 using QuantizerType = ScalarQuantizer::QuantizerType;
 using RangeStat = ScalarQuantizer::RangeStat;
@@ -347,6 +390,231 @@ struct Quantizer8bitDirectSigned_rvv<0> : public Quantizer8bitDirectSigned<1> {
     }
 };
 
+/*******************************************************************
+ * MPMI RVV recovery
+ *
+ * The dense affine base and packed FP16 residuals are widened with the
+ * configured LMUL. FP32 residuals are applied to the same tile before
+ * distance accumulation.
+ *******************************************************************/
+
+struct QuantizerHybridFP8_rvv : public QuantizerHybrid {
+    static constexpr size_t residual_tile_capacity = 256;
+
+    QuantizerHybridFP8_rvv(size_t d, const std::vector<float>& trained)
+            : QuantizerHybrid(d, trained) {}
+
+    void add_residual_tile(
+            const uint8_t* code,
+            size_t begin,
+            size_t count,
+            float* out) const {
+        if (count == 0) {
+            return;
+        }
+        FAISS_THROW_IF_NOT_MSG(
+                begin <= d && count <= d - begin,
+                "MPMI RVV recovery tile is outside the vector dimension");
+
+#if RVANNS_RVV_DECODE_LMUL == 0
+        for (size_t i = 0; i < count; ++i) {
+            out[i] += residual_component(code, begin + i);
+        }
+#else
+        FAISS_THROW_IF_NOT_MSG(
+                count <= residual_tile_capacity,
+                "MPMI RVV recovery tile exceeds its fixed capacity");
+        static_assert(
+                sizeof(_Float16) == sizeof(uint16_t),
+                "MPMI packed FP16 storage requires a 16-bit _Float16 type");
+
+        const size_t fp16_begin_rank = fp16_prefix[begin];
+        const size_t end = begin + count;
+        const size_t fp16_end_rank =
+                end == d ? fp16_count : fp16_prefix[end];
+        const size_t fp16_tile_count = fp16_end_rank - fp16_begin_rank;
+
+        alignas(64) std::array<_Float16, residual_tile_capacity> packed_fp16;
+        alignas(64) std::array<float, residual_tile_capacity> widened_fp16;
+        if (fp16_tile_count != 0) {
+            const size_t fp16_offset =
+                    d + fp16_begin_rank * sizeof(uint16_t);
+            std::memcpy(
+                    packed_fp16.data(),
+                    code + fp16_offset,
+                    fp16_tile_count * sizeof(uint16_t));
+
+            size_t done = 0;
+#if RVANNS_RVV_DECODE_LMUL == 1
+            while (done < fp16_tile_count) {
+                const size_t vl =
+                        __riscv_vsetvl_e16mf2(fp16_tile_count - done);
+                const vfloat16mf2_t residual16 =
+                        __riscv_vle16_v_f16mf2(packed_fp16.data() + done, vl);
+                const vfloat32m1_t residual32 =
+                        __riscv_vfwcvt_f_f_v_f32m1(residual16, vl);
+                __riscv_vse32_v_f32m1(
+                        widened_fp16.data() + done, residual32, vl);
+                done += vl;
+            }
+#elif RVANNS_RVV_DECODE_LMUL == 2
+            while (done < fp16_tile_count) {
+                const size_t vl =
+                        __riscv_vsetvl_e16m1(fp16_tile_count - done);
+                const vfloat16m1_t residual16 =
+                        __riscv_vle16_v_f16m1(packed_fp16.data() + done, vl);
+                const vfloat32m2_t residual32 =
+                        __riscv_vfwcvt_f_f_v_f32m2(residual16, vl);
+                __riscv_vse32_v_f32m2(
+                        widened_fp16.data() + done, residual32, vl);
+                done += vl;
+            }
+#elif RVANNS_RVV_DECODE_LMUL == 8
+            while (done < fp16_tile_count) {
+                const size_t vl =
+                        __riscv_vsetvl_e16m4(fp16_tile_count - done);
+                const vfloat16m4_t residual16 =
+                        __riscv_vle16_v_f16m4(packed_fp16.data() + done, vl);
+                const vfloat32m8_t residual32 =
+                        __riscv_vfwcvt_f_f_v_f32m8(residual16, vl);
+                __riscv_vse32_v_f32m8(
+                        widened_fp16.data() + done, residual32, vl);
+                done += vl;
+            }
+#else
+            while (done < fp16_tile_count) {
+                const size_t vl =
+                        __riscv_vsetvl_e16m2(fp16_tile_count - done);
+                const vfloat16m2_t residual16 =
+                        __riscv_vle16_v_f16m2(packed_fp16.data() + done, vl);
+                const vfloat32m4_t residual32 =
+                        __riscv_vfwcvt_f_f_v_f32m4(residual16, vl);
+                __riscv_vse32_v_f32m4(
+                        widened_fp16.data() + done, residual32, vl);
+                done += vl;
+            }
+#endif
+
+            size_t packed_index = 0;
+            for (size_t i = 0; i < count; ++i) {
+                if (fp16_bitmap[begin + i]) {
+                    out[i] += widened_fp16[packed_index++];
+                }
+            }
+            FAISS_THROW_IF_NOT(packed_index == fp16_tile_count);
+        }
+
+        const size_t fp32_pool_offset =
+                d + fp16_count * sizeof(uint16_t);
+        for (size_t i = 0; i < count; ++i) {
+            const size_t dimension = begin + i;
+            if (fp32_bitmap[dimension]) {
+                float residual;
+                const size_t offset = fp32_pool_offset +
+                        fp32_prefix[dimension] * sizeof(float);
+                std::memcpy(&residual, code + offset, sizeof(residual));
+                out[i] += residual;
+            }
+        }
+#endif
+    }
+
+    void decode_tile(
+            const uint8_t* code,
+            size_t begin,
+            size_t count,
+            float* out) const {
+#if RVANNS_RVV_DECODE_LMUL == 0
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = decode_base(code, begin + i);
+        }
+#elif RVANNS_RVV_DECODE_LMUL == 1
+        size_t done = 0;
+        while (done < count) {
+            const size_t vl = __riscv_vsetvl_e32m1(count - done);
+            const size_t offset = begin + done;
+            const vuint8mf4_t q8 = __riscv_vle8_v_u8mf4(code + offset, vl);
+            const vuint16mf2_t q16 =
+                    __riscv_vwcvtu_x_x_v_u16mf2(q8, vl);
+            const vuint32m1_t q32 = __riscv_vwcvtu_x_x_v_u32m1(q16, vl);
+            const vfloat32m1_t qf = __riscv_vfcvt_f_xu_v_f32m1(q32, vl);
+            const vfloat32m1_t normalized =
+                    __riscv_vfmul_vf_f32m1(qf, 1.0f / 255.0f, vl);
+            const vfloat32m1_t mins =
+                    __riscv_vle32_v_f32m1(vmin + offset, vl);
+            const vfloat32m1_t diffs =
+                    __riscv_vle32_v_f32m1(vdiff + offset, vl);
+            const vfloat32m1_t base = __riscv_vfmadd_vv_f32m1(
+                    normalized, diffs, mins, vl);
+            __riscv_vse32_v_f32m1(out + done, base, vl);
+            done += vl;
+        }
+#elif RVANNS_RVV_DECODE_LMUL == 2
+        size_t done = 0;
+        while (done < count) {
+            const size_t vl = __riscv_vsetvl_e32m2(count - done);
+            const size_t offset = begin + done;
+            const vuint8mf2_t q8 = __riscv_vle8_v_u8mf2(code + offset, vl);
+            const vuint16m1_t q16 = __riscv_vwcvtu_x_x_v_u16m1(q8, vl);
+            const vuint32m2_t q32 = __riscv_vwcvtu_x_x_v_u32m2(q16, vl);
+            const vfloat32m2_t qf = __riscv_vfcvt_f_xu_v_f32m2(q32, vl);
+            const vfloat32m2_t normalized =
+                    __riscv_vfmul_vf_f32m2(qf, 1.0f / 255.0f, vl);
+            const vfloat32m2_t mins =
+                    __riscv_vle32_v_f32m2(vmin + offset, vl);
+            const vfloat32m2_t diffs =
+                    __riscv_vle32_v_f32m2(vdiff + offset, vl);
+            const vfloat32m2_t base = __riscv_vfmadd_vv_f32m2(
+                    normalized, diffs, mins, vl);
+            __riscv_vse32_v_f32m2(out + done, base, vl);
+            done += vl;
+        }
+#elif RVANNS_RVV_DECODE_LMUL == 8
+        size_t done = 0;
+        while (done < count) {
+            const size_t vl = __riscv_vsetvl_e32m8(count - done);
+            const size_t offset = begin + done;
+            const vuint8m2_t q8 = __riscv_vle8_v_u8m2(code + offset, vl);
+            const vuint16m4_t q16 = __riscv_vwcvtu_x_x_v_u16m4(q8, vl);
+            const vuint32m8_t q32 = __riscv_vwcvtu_x_x_v_u32m8(q16, vl);
+            const vfloat32m8_t qf = __riscv_vfcvt_f_xu_v_f32m8(q32, vl);
+            const vfloat32m8_t normalized =
+                    __riscv_vfmul_vf_f32m8(qf, 1.0f / 255.0f, vl);
+            const vfloat32m8_t mins =
+                    __riscv_vle32_v_f32m8(vmin + offset, vl);
+            const vfloat32m8_t diffs =
+                    __riscv_vle32_v_f32m8(vdiff + offset, vl);
+            const vfloat32m8_t base = __riscv_vfmadd_vv_f32m8(
+                    normalized, diffs, mins, vl);
+            __riscv_vse32_v_f32m8(out + done, base, vl);
+            done += vl;
+        }
+#else
+        size_t done = 0;
+        while (done < count) {
+            const size_t vl = __riscv_vsetvl_e32m4(count - done);
+            const size_t offset = begin + done;
+            const vuint8m1_t q8 = __riscv_vle8_v_u8m1(code + offset, vl);
+            const vuint16m2_t q16 = __riscv_vwcvtu_x_x_v_u16m2(q8, vl);
+            const vuint32m4_t q32 = __riscv_vwcvtu_x_x_v_u32m4(q16, vl);
+            const vfloat32m4_t qf = __riscv_vfcvt_f_xu_v_f32m4(q32, vl);
+            const vfloat32m4_t normalized =
+                    __riscv_vfmul_vf_f32m4(qf, 1.0f / 255.0f, vl);
+            const vfloat32m4_t mins =
+                    __riscv_vle32_v_f32m4(vmin + offset, vl);
+            const vfloat32m4_t diffs =
+                    __riscv_vle32_v_f32m4(vdiff + offset, vl);
+            const vfloat32m4_t base = __riscv_vfmadd_vv_f32m4(
+                    normalized, diffs, mins, vl);
+            __riscv_vse32_v_f32m4(out + done, base, vl);
+            done += vl;
+        }
+#endif
+
+        add_residual_tile(code, begin, count, out);
+    }
+};
+
 template <int SIMDWIDTH>
 ScalarQuantizer::SQuantizer* select_quantizer_1_rvv(
         ScalarQuantizer::QuantizerType qtype,
@@ -386,6 +654,8 @@ ScalarQuantizer::SQuantizer* select_quantizer_1_rvv(
             return new Quantizer8bitDirect_rvv<SIMDWIDTH>(dim, trained);
         case ScalarQuantizer::QT_8bit_direct_signed:
             return new Quantizer8bitDirectSigned_rvv<SIMDWIDTH>(dim, trained);
+        case ScalarQuantizer::QT_HYBRID_FP8_16_32:
+            return new QuantizerHybridFP8_rvv(dim, trained);
         default:
             FAISS_THROW_FMT("Quantizer type %d not supported", qtype);
     }
@@ -1040,6 +1310,111 @@ struct DCTemplate_rvv<Quantizer, Similarity, 0> : SQDistanceComputer {
 };
 FAISS_PRAGMA_IMPRECISE_FUNCTION_END
 
+#define RVANNS_HYBRID_ACCUMULATE(LMUL)                                \
+    do {                                                              \
+        size_t offset = 0;                                            \
+        while (offset < count) {                                      \
+            const size_t vl =                                         \
+                    __riscv_vsetvl_e32##LMUL(count - offset);         \
+            const vfloat32##LMUL##_t lhs =                            \
+                    __riscv_vle32_v_f32##LMUL(a + offset, vl);        \
+            const vfloat32##LMUL##_t rhs =                            \
+                    __riscv_vle32_v_f32##LMUL(b + offset, vl);        \
+            vfloat32##LMUL##_t sum =                                  \
+                    __riscv_vfmv_v_f_f32##LMUL(0.0f, vl);            \
+            if constexpr (Similarity::metric_type == METRIC_L2) {     \
+                const vfloat32##LMUL##_t diff =                        \
+                        __riscv_vfsub_vv_f32##LMUL(lhs, rhs, vl);     \
+                sum = __riscv_vfmacc_vv_f32##LMUL(                   \
+                        sum, diff, diff, vl);                          \
+            } else {                                                  \
+                sum = __riscv_vfmacc_vv_f32##LMUL(                   \
+                        sum, lhs, rhs, vl);                            \
+            }                                                         \
+            vfloat32m1_t zero = __riscv_vfmv_v_f_f32m1(0.0f, 1);    \
+            const vfloat32m1_t reduced =                              \
+                    __riscv_vfredusum_vs_f32##LMUL##_f32m1(          \
+                            sum, zero, vl);                            \
+            total += __riscv_vfmv_f_s_f32m1_f32(reduced);           \
+            offset += vl;                                             \
+        }                                                             \
+    } while (false)
+
+template <class Similarity>
+struct HybridDistanceComputer_rvv : SQDistanceComputer {
+    using Sim = Similarity;
+    static constexpr size_t tile_size = 256;
+
+    QuantizerHybridFP8_rvv quant;
+    mutable std::array<float, tile_size> decoded;
+    mutable std::array<float, tile_size> decoded2;
+
+    HybridDistanceComputer_rvv(
+            size_t d,
+            const std::vector<float>& trained)
+            : quant(d, trained) {}
+
+    void set_query(const float* x) final {
+        q = x;
+    }
+
+    float accumulate_tile(
+            const float* a,
+            const float* b,
+            size_t count) const {
+        float total = 0.0f;
+#if RVANNS_RVV_ACC_LMUL == 0
+        for (size_t i = 0; i < count; ++i) {
+            if constexpr (Similarity::metric_type == METRIC_L2) {
+                const float diff = a[i] - b[i];
+                total += diff * diff;
+            } else {
+                total += a[i] * b[i];
+            }
+        }
+#elif RVANNS_RVV_ACC_LMUL == 1
+        RVANNS_HYBRID_ACCUMULATE(m1);
+#elif RVANNS_RVV_ACC_LMUL == 2
+        RVANNS_HYBRID_ACCUMULATE(m2);
+#elif RVANNS_RVV_ACC_LMUL == 4
+        RVANNS_HYBRID_ACCUMULATE(m4);
+#else
+        RVANNS_HYBRID_ACCUMULATE(m8);
+#endif
+        return total;
+    }
+
+    float compute_distance(const float* x, const uint8_t* code) const {
+        float total = 0.0f;
+        for (size_t begin = 0; begin < quant.d; begin += tile_size) {
+            const size_t count = std::min(tile_size, quant.d - begin);
+            quant.decode_tile(code, begin, count, decoded.data());
+            total += accumulate_tile(x + begin, decoded.data(), count);
+        }
+        return total;
+    }
+
+    float query_to_code(const uint8_t* code) const override final {
+        return compute_distance(q, code);
+    }
+
+    float symmetric_dis(idx_t i, idx_t j) override {
+        const uint8_t* code_i = codes + i * code_size;
+        const uint8_t* code_j = codes + j * code_size;
+        float total = 0.0f;
+        for (size_t begin = 0; begin < quant.d; begin += tile_size) {
+            const size_t count = std::min(tile_size, quant.d - begin);
+            quant.decode_tile(code_i, begin, count, decoded.data());
+            quant.decode_tile(code_j, begin, count, decoded2.data());
+            total += accumulate_tile(
+                    decoded.data(), decoded2.data(), count);
+        }
+        return total;
+    }
+};
+
+#undef RVANNS_HYBRID_ACCUMULATE
+
 /*******************************************************************
  * DistanceComputerByte: computes distances in the integer domain
  *******************************************************************/
@@ -1202,6 +1577,9 @@ ScalarQuantizer::SQDistanceComputer* select_distance_computer_rvv(
                     Similarity,
                     0>(dim, trained);
 
+        case ScalarQuantizer::QT_HYBRID_FP8_16_32:
+            return new HybridDistanceComputer_rvv<Similarity>(dim, trained);
+
         default:
             FAISS_THROW_FMT("Quantizer type %d not supported", qtype);
             return nullptr;
@@ -1307,6 +1685,11 @@ InvertedListScanner* sel1_InvertedListScanner_rvv(
                     Quantizer8bitDirectSigned_rvv<SIMDWIDTH>,
                     Similarity,
                     SIMDWIDTH>>(sq, quantizer, store_pairs, sel, r);
+
+        case QuantizerType::QT_HYBRID_FP8_16_32:
+            return sel2_InvertedListScanner_rvv<
+                    HybridDistanceComputer_rvv<Similarity>>(
+                    sq, quantizer, store_pairs, sel, r);
 
         default:
             FAISS_THROW_MSG("unknown qtype");

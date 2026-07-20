@@ -97,10 +97,18 @@ class FaissHnswSqConfig : public FaissHnswConfig {
     // user can use quant_type to control quantizer type.
     // we have fp16, bf16, etc, so '8', '4' and '6' is insufficient
     CFG_STRING sq_type;
+    // Static post-build physical layout. ROrder combines a GOrder-style
+    // global permutation with level-0 adjacency-list normalization.
+    CFG_STRING graph_layout;
     KNOHWERE_DECLARE_CONFIG(FaissHnswSqConfig) {
         KNOWHERE_CONFIG_DECLARE_FIELD(sq_type)
             .set_default("SQ8")
             .description("scalar quantizer type")
+            .for_train()
+            .for_static();
+        KNOWHERE_CONFIG_DECLARE_FIELD(graph_layout)
+            .set_default("unordered")
+            .description("post-build HNSW physical layout")
             .for_train()
             .for_static();
     };
@@ -121,6 +129,17 @@ class FaissHnswSqConfig : public FaissHnswConfig {
                 return HandleError(err_msg, msg, Status::invalid_args);
             }
 
+            const auto graph_layout_v = graph_layout.value();
+            if (!WhetherAcceptableGraphLayout(graph_layout_v)) {
+                std::string msg = "invalid HNSW graph layout: " + graph_layout_v +
+                                  ", optional layouts are [unordered, bfs, rcm, rabbitorder, gorder, rorder]";
+                return HandleError(err_msg, msg, Status::invalid_args);
+            }
+            if (str_to_lower(graph_layout_v) != "unordered" && refine.value_or(false)) {
+                std::string msg = "post-build graph layout is not supported together with refine";
+                return HandleError(err_msg, msg, Status::invalid_args);
+            }
+
             // check refine
             if (refine_type.has_value()) {
                 if (!WhetherAcceptableRefineType(refine_type.value())) {
@@ -137,7 +156,7 @@ class FaissHnswSqConfig : public FaissHnswConfig {
     bool
     WhetherAcceptableQuantType(const std::string& sq_type) {
         // todo: add more
-        std::vector<std::string> allowed_list = {"sq6", "sq8", "fp16", "bf16"};
+        std::vector<std::string> allowed_list = {"sq6", "sq8", "fp16", "bf16", "mpmi"};
         std::string sq_type_tolower = str_to_lower(sq_type);
 
         for (const auto& allowed : allowed_list) {
@@ -146,6 +165,20 @@ class FaissHnswSqConfig : public FaissHnswConfig {
             }
         }
 
+        return false;
+    }
+
+    bool
+    WhetherAcceptableGraphLayout(const std::string& graph_layout) {
+        const std::vector<std::string> allowed_list = {
+            "unordered", "bfs", "rcm", "rabbitorder", "gorder", "rorder"};
+        const std::string graph_layout_tolower = str_to_lower(graph_layout);
+
+        for (const auto& allowed : allowed_list) {
+            if (graph_layout_tolower == allowed) {
+                return true;
+            }
+        }
         return false;
     }
 };

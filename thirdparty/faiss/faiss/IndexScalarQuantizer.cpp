@@ -44,6 +44,7 @@ IndexScalarQuantizer::IndexScalarQuantizer()
 
 void IndexScalarQuantizer::train(idx_t n, const float* x) {
     sq.train(n, x);
+    code_size = sq.code_size;
     is_trained = true;
 }
 
@@ -147,6 +148,8 @@ void IndexIVFScalarQuantizer::train_encoder(
         const float* x,
         const idx_t* assign) {
     sq.train(n, x);
+    code_size = sq.code_size;
+    invlists->code_size = code_size;
 }
 
 idx_t IndexIVFScalarQuantizer::train_encoder_num_vectors() const {

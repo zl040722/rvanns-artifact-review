@@ -2,7 +2,7 @@ This document helps reviewers build the artifact from source code, understand it
 
 ## Introduction
 
-This artifact supports approximate nearest neighbor search experiments on vector databases. The repository keeps a C++ vector search engine structure, adds post-build HNSW graph reordering support through `IndexHNSW::reorder_graph_after_build`, and provides standalone evaluation programs for HNSW, HNSW-SQ/MPMI, and graph-layout-aware batch-search experiments. The added programs load vector datasets, build or reuse cached indexes, compute or read ground truth, sweep search parameters, and write recall, QPS, and latency results into `vectors_out/results`.
+This artifact supports approximate nearest-neighbor search experiments for the RIVER paper. It implements MPMI as a common compact scalar-quantizer representation, provides an RVV-specialized tile-wise recovery and distance path, and implements ROrder as a post-build HNSW layout pass. The regular Knowhere HNSW-SQ build path accepts `sq_type=mpmi` and `graph_layout=rorder`; standalone programs additionally exercise the paper-facing S/V/M/F configurations, numerical agreement, and graph-layout baselines.
 
 ## Artifact Notes
 
@@ -10,18 +10,37 @@ This artifact includes the optimized implementation, patches, and test programs 
 
 The main artifact-related files are:
 
-- `thirdparty/faiss/faiss/IndexHNSW.h` and `thirdparty/faiss/faiss/IndexHNSW.cpp`: add post-build graph reordering APIs, keep the `perm[new_id]=old_id` mapping, and support BFS and `rorder` traversal methods.
-- `patches/mpmi.patch`: stores the architecture-specific MPMI source patch used to reproduce the corresponding implementation changes.
-- the dedicated evaluation-test directory under `tests/`: contains five standalone C++ test and performance programs, about 3K non-empty source lines in total.
+- `thirdparty/faiss/faiss/impl/ScalarQuantizer.h`, `ScalarQuantizer.cpp`, and `IndexScalarQuantizer.cpp`: define the MPMI type, offline residual selection, compact row format, and dynamic code size.
+- `thirdparty/faiss/faiss/impl/ScalarQuantizerCodec_rvv.h` and `ScalarQuantizerDC_rvv.cpp`: widen the dense base and packed FP16 residuals within each recovery tile before RVV distance accumulation. Other CPU backends use the common MPMI representation with the existing dispatched FP32 distance primitive.
+- `thirdparty/faiss/faiss/IndexHNSW.h` and `IndexHNSW.cpp`: keep `perm[new_id]=old_id` and support unordered, BFS, RCM, RabbitOrder, GOrder-only, and full ROrder layouts. ROrder uses the same static topology-derived global permutation as GOrder and additionally normalizes level-0 adjacency order.
+- `src/index/refine/refine_utils.cc`, `src/index/hnsw/faiss_hnsw_config.h`, and `faiss_hnsw.cc`: expose MPMI and the static layout choice through the normal Knowhere HNSW-SQ build path, preserve original IDs for search and filtering, and serialize the mapping used by Milvus-facing calls.
+- `tests/rvanns/test_mpmi_cq1.cpp`: runs S=Scalar+FP32, V=SIMD+FP32, M=SIMD+MPMI, and F=MPMI+ROrder while reporting the effective backend, quantizer, layout, and RVV LMUL settings.
+- `tests/rvanns/test_mpmi_correctness.cpp`, `test_hnsw_reorder_micro.cpp`, and `test_knowhere_mpmi_rorder.cpp`: check MPMI numerical agreement, low-level graph-layout contracts, and the normal Knowhere build/search/filter/serialization path.
+- `patches/mpmi.patch`: records the MPMI source delta separately from the complete artifact patch delivered with the release.
 - `scripts/`, `ci/`, `CMakeLists.txt`, and `conanfile.py`: provide dependency installation, build, coverage, and CI entry points used by the artifact.
 
-The standalone evaluation programs cover:
+The paper-facing standalone programs cover:
 
 - HNSW baseline sweeps over datasets and `efSearch` values.
 - HNSW batch-search performance runs with perf counter collection.
-- HNSW-SQ/MPMI evaluation with optional graph reordering and CSV output under `vectors_out/results`.
-- MPMI-focused performance runs.
-- HNSW-SQ/MPMI batch-search performance runs with graph-layout-aware traversal.
+- the four S/V/M/F paths with quantizer- and layout-qualified index caches;
+- MPMI portable-reference versus selected-backend distance checks for L2 and inner product; and
+- unordered, BFS, RCM, RabbitOrder, GOrder, and ROrder under one HNSW query path.
+
+Each graph layout is a one-shot post-build choice. The direct-Faiss experiment
+drivers cache the unordered index, reapply the selected layout after loading,
+and use `perm[new_id]=old_id` to return results to the original ID space because
+the added mapping is not part of upstream Faiss serialization. The normal
+Knowhere HNSW-SQ `Build` path instead stores that mapping in its existing index
+wrapper header, so a serialized ROrder index preserves Milvus-visible IDs and
+bitset semantics after loading. Both paths reject adding vectors after layout;
+rebuild from the pre-layout data when the graph must be extended. The normal
+Knowhere hook is deliberately limited to one non-refined, non-partitioned
+HNSW-SQ index, matching the paper's static post-build evaluation path. Invoke
+the combined `Build` API for a non-`unordered` layout; a separate `Train` then
+`Add` sequence intentionally remains growable and does not trigger the pass.
+The existing `trace_visit` debugging output is rejected after layout because
+its records use Faiss-internal IDs rather than the persisted external-ID map.
 
 The regular unit tests are built when `with_ut=True`/`WITH_UT=ON` is enabled and run through the generated unit-test binary under `tests/ut/`. Faiss tests can be enabled with `with_faiss_tests=True`/`WITH_FAISS_TESTS=ON`. The Python tests live under `tests/python/`, and CI/E2E coverage is described by the Jenkins/Groovy files under `ci/`.
 
@@ -80,6 +99,40 @@ conan install .. --build=missing -o with_ut=True -s compiler.libcxx=libc++ -s bu
 #build with conan
 conan build ..
 ```
+
+#### Build and run the RIVER checks
+
+Enable the standalone artifact targets through the Conan option when creating a
+Release build:
+
+```bash
+$ conan install .. --build=missing -o with_river_artifact_tests=True \
+    -s compiler.libcxx=libstdc++11 -s build_type=Release
+$ conan build ..
+$ ctest --output-on-failure -R '^river_'
+```
+
+The four registered tests are self-contained: `river_mpmi_correctness`
+validates the compact row format and selected distance backend;
+`river_knowhere_mpmi_rorder` validates the normal Knowhere build, original-ID
+filtering, and serialization round trip; `river_hnsw_layout_contract` validates
+all six low-level layout paths; and `river_hnsw_layout_singleton` covers the
+one-node GOrder/ROrder edge case. The dataset-driven S/V/M/F program is built as `test_mpmi_cq1`; run
+`test_mpmi_cq1 --help` for its arguments.
+
+On a RISC-V build, CMake applies
+`-march=rv64gcv_zvfhmin -mabi=lp64d`; the Release configuration adds `-O3`.
+The RVV MPMI defaults are decode `LMUL=4` and accumulation `LMUL=2`. Sensitivity
+builds can override `RVANNS_RVV_DECODE_LMUL`, `RVANNS_RVV_ACC_LMUL`, and
+`RVANNS_RVV_LMUL_TAG` as CMake cache variables.
+
+The checked-in paper-facing configuration selects `ceil(1% * D)` FP32 residual
+dimensions, then `ceil(10% * D)` disjoint FP16 residual dimensions, and uses a
+GOrder layout window of 5. The S/V/M/F driver reproduces these defaults. The
+other residual-budget and layout-window points in the paper are separate
+source-level sensitivity builds, not runtime options in this minimal artifact
+driver; change the constants in `ScalarQuantizer.cpp` and `IndexHNSW.cpp`,
+respectively, and rebuild before regenerating those points.
 
 #### Running Unit Tests
 

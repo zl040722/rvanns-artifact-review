@@ -33,6 +33,7 @@ class KnowhereConan(ConanFile):
         "with_benchmark": [True, False],
         "with_coverage": [True, False],
         "with_faiss_tests": [True, False],
+        "with_river_artifact_tests": [True, False],
         "with_light": [True, False],
         "with_compile_prune": [True, False],
     }
@@ -56,6 +57,7 @@ class KnowhereConan(ConanFile):
         "boost:without_stacktrace": True,
         "fmt:header_only": True,
         "with_faiss_tests": False,
+        "with_river_artifact_tests": False,
         "libcurl:with_ssl": False,
         "with_light": False,
         "with_compile_prune": False,
@@ -66,6 +68,7 @@ class KnowhereConan(ConanFile):
         "src/*",
         "thirdparty/*",
         "tests/ut/*",
+        "tests/rvanns/*",
         "include/*",
         "CMakeLists.txt",
         "*.cmake",
@@ -183,6 +186,9 @@ class KnowhereConan(ConanFile):
         tc.variables["WITH_BENCHMARK"] = self.options.with_benchmark
         tc.variables["WITH_COVERAGE"] = self.options.with_coverage
         tc.variables["WITH_FAISS_TESTS"] = self.options.with_faiss_tests
+        tc.variables["RIVER_BUILD_ARTIFACT_TESTS"] = (
+            self.options.with_river_artifact_tests
+        )
         tc.variables["WITH_LIGHT"] = self.options.with_light
         tc.variables["WITH_COMPILE_PRUNE"] = self.options.with_compile_prune
 

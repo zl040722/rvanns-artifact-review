@@ -55,9 +55,8 @@ struct IndexHNSW : Index {
     // used when GpuIndexCagra::copyFrom(IndexHNSWCagra*) is invoked.
     bool keep_max_size_level0 = false;
 
-    // ID mapping after reordering: perm[new_id] = old_id
-    // This is used to convert new IDs back to original IDs for recall
-    // calculation
+    // In-memory ID mapping after reordering: perm[new_id] = old_id.
+    // The artifact drivers use it to report results in the original ID space.
     std::vector<idx_t> reorder_perm;
 
     explicit IndexHNSW(int d = 0, int M = 32, MetricType metric = METRIC_L2);
@@ -132,15 +131,17 @@ struct IndexHNSW : Index {
     void permute_entries(const idx_t* perm);
 
     /**
-     * Reorder nodes using graph traversal algorithms to improve spatial
-     * locality. This should be called after all vectors are added but before
-     * saving to disk.
+     * Reorder nodes using graph-derived layout methods to improve spatial
+     * locality. This is a one-shot, in-memory post-build pass: call it after
+     * all vectors are added, and retain get_reorder_perm() while remapping
+     * returned IDs. Repeated layout passes and subsequent additions are
+     * rejected until reset() rebuilds the index state.
      *
      * @param level Graph level to use for traversal (default: 0, only level-0
      * supported)
-     * @param method Traversal method 
-     * @param freeze Whether to freeze the index after reordering (default:
-     * true)
+     * @param method Layout method ("bfs", "gorder", "rorder", "rcm",
+     *               or "rabbitorder", default: "bfs")
+     * @param freeze Reserved for API compatibility; currently ignored.
      */
     void reorder_graph_after_build(
             int level = 0,
@@ -179,8 +180,15 @@ struct IndexHNSW : Index {
     DistanceComputer* make_distance_computer() const;
 
    private:
-    // Generate Rorder permutation for graph reordering
-    std::vector<idx_t> generateRorderPermutation();
+    std::vector<idx_t> generateBFSPermutation(int level) const;
+
+    std::vector<idx_t> generateRCMPermutation() const;
+
+    std::vector<idx_t> generateRabbitOrderPermutation() const;
+
+    // Generate the topology-derived GOrder permutation used by GOrder and
+    // ROrder.
+    std::vector<idx_t> generateGorderPermutation();
 
     struct CacheAlignedCoLayout;
     std::unique_ptr<CacheAlignedCoLayout> cache_aligned_soa_;

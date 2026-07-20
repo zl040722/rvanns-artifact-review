@@ -180,7 +180,7 @@ class BaseFaissRegularIndexNode : public BaseFaissIndexNode {
 
         try {
             MemoryIOWriter writer;
-            if (indexes.size() > 1) {
+            if (indexes.size() > 1 || !labels.empty()) {
                 // this is a hack for compatibility, faiss index has 4-byte header to indicate index category
                 // create a new one to distinguish MV faiss hnsw from faiss hnsw
                 faiss::write_mv(&writer);
@@ -218,6 +218,7 @@ class BaseFaissRegularIndexNode : public BaseFaissIndexNode {
             // create a new one to distinguish MV faiss hnsw from faiss hnsw
             bool is_mv = faiss::read_is_mv(&reader);
             if (is_mv) {
+                internal_offset_to_most_external_id.clear();
                 LOG_KNOWHERE_INFO_ << "start to load index by mv";
                 uint32_t v = readHeader(&reader);
                 indexes.resize(v);
@@ -229,7 +230,12 @@ class BaseFaissRegularIndexNode : public BaseFaissIndexNode {
             } else {
                 reader.reset();
                 auto read_index = std::unique_ptr<faiss::Index>(faiss::read_index(&reader));
+                indexes.resize(1);
                 indexes[0].reset(read_index.release());
+                labels.clear();
+                index_rows_sum.clear();
+                label_to_internal_offset.clear();
+                internal_offset_to_most_external_id.clear();
             }
         } catch (const std::exception& e) {
             if (is_faiss_fourcc_error(e.what())) {
@@ -259,6 +265,7 @@ class BaseFaissRegularIndexNode : public BaseFaissIndexNode {
             bool is_mv = faiss::read_is_mv(filename.data());
             if (is_mv) {
                 auto read_index = [&](faiss::IOReader* r) {
+                    internal_offset_to_most_external_id.clear();
                     LOG_KNOWHERE_INFO_ << "start to load index by mv";
                     read_is_mv(r);
                     uint32_t v = readHeader(r);
@@ -280,7 +287,12 @@ class BaseFaissRegularIndexNode : public BaseFaissIndexNode {
                 }
             } else {
                 auto read_index = std::unique_ptr<faiss::Index>(faiss::read_index(filename.data(), io_flags));
+                indexes.resize(1);
                 indexes[0].reset(read_index.release());
+                labels.clear();
+                index_rows_sum.clear();
+                label_to_internal_offset.clear();
+                internal_offset_to_most_external_id.clear();
             }
         } catch (const std::exception& e) {
             if (is_faiss_fourcc_error(e.what())) {
@@ -327,8 +339,14 @@ class BaseFaissRegularIndexNode : public BaseFaissIndexNode {
 
         // a temporary yet expensive workaround
         faiss::cppcontrib::knowhere::CountSizeIOWriter writer;
-        for (const auto& index : indexes) {
-            faiss::write_index(index.get(), &writer);
+        if (indexes.size() > 1 || !labels.empty()) {
+            faiss::write_mv(&writer);
+            writeHeader(&writer);
+            for (const auto& index : indexes) {
+                faiss::write_index(index.get(), &writer);
+            }
+        } else {
+            faiss::write_index(indexes[0].get(), &writer);
         }
 
         // todo
@@ -339,7 +357,7 @@ class BaseFaissRegularIndexNode : public BaseFaissIndexNode {
     GetInternalIdToExternalIdMap() const override {
         auto internal_offset_to_label = std::make_shared<std::vector<uint32_t>>();
         assert(indexes.size() > 0);
-        if (indexes.size() == 1) {
+        if (labels.empty()) {
             // without mv-only labels, the id mapping is the same as the internal offset.
             internal_offset_to_label->resize(Count());
             std::iota(internal_offset_to_label->begin(), internal_offset_to_label->end(), 0);
@@ -1140,7 +1158,7 @@ class BaseFaissRegularIndexHNSWNode : public BaseFaissRegularIndexNode {
         auto ids = dataset->GetIds();
 
         auto get_vector = [&](int64_t id, float* result) -> bool {
-            if (indexes.size() == 1) {
+            if (label_to_internal_offset.empty()) {
                 indexes_to_reconstruct_from[0]->reconstruct(id, result);
             } else {
                 auto it =
@@ -1272,14 +1290,14 @@ class BaseFaissRegularIndexHNSWNode : public BaseFaissRegularIndexNode {
         const auto k = hnsw_cfg.k.value();
 
         BitsetView bitset(bitset_);
-        if (!internal_offset_to_most_external_id.empty()) {
+        if (!internal_offset_to_most_external_id.empty() && !bitset.empty()) {
             bitset.set_out_ids(internal_offset_to_most_external_id.data(), internal_offset_to_most_external_id.size());
         }
         auto index_id = getIndexToSearchByScalarInfo(bitset);
         if (index_id < 0) {
             return expected<DataSetPtr>::Err(Status::invalid_args, "partition key value not correctly set");
         }
-        if (indexes.size() > 1) {
+        if (!labels.empty() && !bitset.empty()) {
             // calculate more accurate filter statistics for the single mv-index.
             size_t num_mv_ids = labels[index_id].get()->size();
             size_t num_mv_filtered_out_ids = num_mv_ids - (bitset.size() - bitset.count());
@@ -1293,6 +1311,10 @@ class BaseFaissRegularIndexHNSWNode : public BaseFaissRegularIndexNode {
 
         feder::hnsw::FederResultUniq feder_result;
         if (hnsw_cfg.trace_visit.value()) {
+            if (!labels.empty()) {
+                return expected<DataSetPtr>::Err(
+                    Status::invalid_args, "trace_visit is not supported after a post-build graph layout");
+            }
             if (rows != 1) {
                 return expected<DataSetPtr>::Err(Status::invalid_args, "a single query vector is required");
             }
@@ -1483,7 +1505,7 @@ class BaseFaissRegularIndexHNSWNode : public BaseFaissRegularIndexNode {
         auto distances = std::make_unique<float[]>(rows * labels_len);
 
         BitsetView bitset(bitset_);
-        if (!internal_offset_to_most_external_id.empty()) {
+        if (!internal_offset_to_most_external_id.empty() && !bitset.empty()) {
             bitset.set_out_ids(internal_offset_to_most_external_id.data(), internal_offset_to_most_external_id.size());
         }
         auto index_id = getIndexToSearchByScalarInfo(bitset);
@@ -1519,7 +1541,7 @@ class BaseFaissRegularIndexHNSWNode : public BaseFaissRegularIndexNode {
                     dist_computer->set_query(cur_query);
                     for (auto j = 0; j < labels_len; j++) {
                         auto id = labels[j];
-                        if (indexes.size() > 1) {
+                        if (!label_to_internal_offset.empty()) {
                             id = label_to_internal_offset[labels[j]] - index_rows_sum[index_id];
                         }
                         distances[idx * labels_len + j] = (*dist_computer)(id);
@@ -1563,14 +1585,14 @@ class BaseFaissRegularIndexHNSWNode : public BaseFaissRegularIndexNode {
 
         const auto hnsw_cfg = static_cast<const FaissHnswConfig&>(*cfg);
         BitsetView bitset(bitset_);
-        if (!internal_offset_to_most_external_id.empty()) {
+        if (!internal_offset_to_most_external_id.empty() && !bitset.empty()) {
             bitset.set_out_ids(internal_offset_to_most_external_id.data(), internal_offset_to_most_external_id.size());
         }
         auto index_id = getIndexToSearchByScalarInfo(bitset);
         if (index_id < 0) {
             return expected<DataSetPtr>::Err(Status::invalid_args, "partition key value not correctly set");
         }
-        if (indexes.size() > 1) {
+        if (!labels.empty() && !bitset.empty()) {
             size_t num_mv_ids = labels[index_id].get()->size();
             size_t num_mv_filtered_out_ids = num_mv_ids - (bitset.size() - bitset.count());
             if (!bitset.has_out_ids()) {
@@ -1588,6 +1610,10 @@ class BaseFaissRegularIndexHNSWNode : public BaseFaissRegularIndexNode {
 
         feder::hnsw::FederResultUniq feder_result;
         if (hnsw_cfg.trace_visit.value()) {
+            if (!labels.empty()) {
+                return expected<DataSetPtr>::Err(
+                    Status::invalid_args, "trace_visit is not supported after a post-build graph layout");
+            }
             if (rows != 1) {
                 return expected<DataSetPtr>::Err(Status::invalid_args, "a single query vector is required");
             }
@@ -1723,6 +1749,11 @@ class BaseFaissRegularIndexHNSWNode : public BaseFaissRegularIndexNode {
         if (isIndexEmpty()) {
             LOG_KNOWHERE_ERROR_ << "Can not add data to an empty index.";
             return Status::empty_index;
+        }
+
+        if (indexes.size() == 1 && !labels.empty()) {
+            LOG_KNOWHERE_ERROR_ << "Can not add data after a post-build HNSW layout pass.";
+            return Status::invalid_args;
         }
 
         auto rows = dataset->GetRows();
@@ -1891,7 +1922,7 @@ class BaseFaissRegularIndexHNSWNode : public BaseFaissRegularIndexNode {
 
         const FaissHnswConfig& hnsw_cfg = static_cast<const FaissHnswConfig&>(*cfg);
         BitsetView bitset(bitset_);
-        if (!internal_offset_to_most_external_id.empty()) {
+        if (!internal_offset_to_most_external_id.empty() && !bitset.empty()) {
             bitset.set_out_ids(internal_offset_to_most_external_id.data(), internal_offset_to_most_external_id.size());
         }
         int index_id = getIndexToSearchByScalarInfo(bitset);
@@ -1899,7 +1930,7 @@ class BaseFaissRegularIndexHNSWNode : public BaseFaissRegularIndexNode {
             return expected<std::vector<IndexNode::IteratorPtr>>::Err(Status::invalid_args,
                                                                       "partition key value not correctly set");
         }
-        if (indexes.size() > 1) {
+        if (!labels.empty() && !bitset.empty()) {
             size_t num_mv_ids = labels[index_id].get()->size();
             size_t num_mv_filtered_out_ids = num_mv_ids - (bitset.size() - bitset.count());
             if (!bitset.has_out_ids()) {
@@ -2344,6 +2375,45 @@ class BaseFaissRegularIndexHNSWSQNode : public BaseFaissRegularIndexHNSWNode {
         : BaseFaissRegularIndexHNSWNode(version, object, data_format) {
     }
 
+    Status
+    Build(const DataSetPtr dataset, std::shared_ptr<Config> cfg, bool use_knowhere_build_pool = true) override {
+        const auto& hnsw_cfg = static_cast<const FaissHnswSqConfig&>(*cfg);
+        const std::string graph_layout = str_to_lower(hnsw_cfg.graph_layout.value());
+
+        if (graph_layout != "unordered") {
+            const auto& scalar_info_map =
+                dataset->Get<std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>>>(meta::SCALAR_INFO);
+            if (!scalar_info_map.empty()) {
+                LOG_KNOWHERE_ERROR_ << "post-build graph layout is supported only for a regular single HNSW index";
+                return Status::invalid_args;
+            }
+        }
+
+        RETURN_IF_ERROR(Train(dataset, cfg, use_knowhere_build_pool));
+        RETURN_IF_ERROR(Add(dataset, cfg, use_knowhere_build_pool));
+        if (graph_layout == "unordered") {
+            return Status::success;
+        }
+        auto layout_result =
+            build_pool
+                ->push([&] {
+                    std::unique_ptr<ThreadPool::ScopedBuildOmpSetter> setter;
+                    if (hnsw_cfg.num_build_thread.has_value()) {
+                        setter = std::make_unique<ThreadPool::ScopedBuildOmpSetter>(
+                            hnsw_cfg.num_build_thread.value());
+                    } else {
+                        setter = std::make_unique<ThreadPool::ScopedBuildOmpSetter>();
+                    }
+                    return ApplyGraphLayout(graph_layout);
+                })
+                .getTry();
+        if (!layout_result.hasValue()) {
+            LOG_KNOWHERE_WARNING_ << "post-build HNSW layout failed: " << layout_result.exception().what();
+            return Status::faiss_inner_error;
+        }
+        return layout_result.value();
+    }
+
     static std::unique_ptr<BaseConfig>
     StaticCreateConfig() {
         return std::make_unique<FaissHnswSqConfig>();
@@ -2361,7 +2431,65 @@ class BaseFaissRegularIndexHNSWSQNode : public BaseFaissRegularIndexHNSWNode {
 
  protected:
     Status
+    ApplyGraphLayout(const std::string& graph_layout) {
+        if (graph_layout == "unordered") {
+            return Status::success;
+        }
+        if (indexes.size() != 1 || indexes[0] == nullptr || !labels.empty()) {
+            LOG_KNOWHERE_ERROR_ << "post-build graph layout requires one unmodified HNSW index";
+            return Status::invalid_index_error;
+        }
+
+        auto* hnsw_index = dynamic_cast<faiss::IndexHNSW*>(indexes[0].get());
+        if (hnsw_index == nullptr) {
+            LOG_KNOWHERE_ERROR_ << "post-build graph layout requires an HNSW index without refine";
+            return Status::invalid_index_error;
+        }
+
+        try {
+            hnsw_index->reorder_graph_after_build(0, graph_layout.c_str(), true);
+            const auto& permutation = hnsw_index->get_reorder_perm();
+            const size_t count = static_cast<size_t>(hnsw_index->ntotal);
+            if (permutation.size() != count || count > std::numeric_limits<uint32_t>::max()) {
+                LOG_KNOWHERE_ERROR_ << "invalid post-build HNSW permutation";
+                return Status::invalid_index_error;
+            }
+
+            auto new_to_original = std::make_shared<std::vector<uint32_t>>(count);
+            std::vector<uint32_t> original_to_new(count);
+            std::vector<uint8_t> seen(count, 0);
+            for (size_t new_id = 0; new_id < count; ++new_id) {
+                const faiss::idx_t old_id = permutation[new_id];
+                if (old_id < 0 || static_cast<size_t>(old_id) >= count || seen[old_id] != 0) {
+                    LOG_KNOWHERE_ERROR_ << "post-build HNSW permutation is not bijective";
+                    return Status::invalid_index_error;
+                }
+                seen[old_id] = 1;
+                new_to_original->operator[](new_id) = static_cast<uint32_t>(old_id);
+                original_to_new[old_id] = static_cast<uint32_t>(new_id);
+            }
+
+            labels = {std::move(new_to_original)};
+            index_rows_sum = {0, static_cast<uint32_t>(count)};
+            label_to_internal_offset = std::move(original_to_new);
+            LOG_KNOWHERE_INFO_ << "Applied post-build HNSW graph layout: " << graph_layout;
+            return Status::success;
+        } catch (const std::exception& e) {
+            LOG_KNOWHERE_WARNING_ << "post-build HNSW layout failed: " << e.what();
+            return Status::faiss_inner_error;
+        }
+    }
+
+    Status
     TrainInternal(const DataSetPtr dataset, const Config& cfg) override {
+        // Training starts a new logical index and clears any persisted physical
+        // ID mapping left by a previous post-build layout.
+        indexes.assign(1, nullptr);
+        labels.clear();
+        index_rows_sum.clear();
+        label_to_internal_offset.clear();
+        internal_offset_to_most_external_id.clear();
+
         // number of rows
         auto rows = dataset->GetRows();
         // dimensionality of the data

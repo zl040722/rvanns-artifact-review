@@ -38,6 +38,10 @@ knowhere_option(WITH_COVERAGE "Build with coverage" OFF)
 knowhere_option(WITH_CCACHE "Build with ccache" ON)
 knowhere_option(WITH_PROFILER "Build with profiler" OFF)
 knowhere_option(WITH_FAISS_TESTS "Build with Faiss unit tests" OFF)
+knowhere_option(
+  RIVER_BUILD_ARTIFACT_TESTS
+  "Build the standalone RIVER MPMI and graph-layout checks"
+  OFF)
 knowhere_option(WITH_LIGHT "Build with light weight version" OFF)
 knowhere_option(WITH_COMPILE_PRUNE "Enable compile prune" ON)
 
@@ -225,6 +229,11 @@ if (WITH_CARDINAL)
 endif()
 
 target_include_directories(knowhere PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+if(RIVER_BUILD_ARTIFACT_TESTS)
+  enable_testing()
+  add_subdirectory(tests/rvanns)
+endif()
 
 if(WITH_UT)
   find_package(Catch2 REQUIRED)
