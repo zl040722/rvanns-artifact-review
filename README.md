@@ -13,9 +13,9 @@ The main artifact-related files are:
 - `thirdparty/faiss/faiss/impl/ScalarQuantizer.h`, `ScalarQuantizer.cpp`, and `IndexScalarQuantizer.cpp`: define the MPMI type, offline residual selection, compact row format, and dynamic code size.
 - `thirdparty/faiss/faiss/impl/ScalarQuantizerCodec_rvv.h` and `ScalarQuantizerDC_rvv.cpp`: widen the dense base and packed FP16 residuals within each recovery tile before RVV distance accumulation. Other CPU backends use the common MPMI representation with the existing dispatched FP32 distance primitive.
 - `thirdparty/faiss/faiss/IndexHNSW.h` and `IndexHNSW.cpp`: keep `perm[new_id]=old_id` and support unordered, BFS, RCM, RabbitOrder, GOrder-only, and full ROrder layouts. ROrder uses the same static topology-derived global permutation as GOrder and additionally normalizes level-0 adjacency order.
-- `src/index/refine/refine_utils.cc`, `src/index/hnsw/faiss_hnsw_config.h`, and `faiss_hnsw.cc`: expose MPMI and the static layout choice through the normal HNSW-SQ build path, preserve original IDs for search and filtering, and serialize the mapping used by Milvus-facing calls.
+- `src/index/refine/refine_utils.cc`, `src/index/hnsw/faiss_hnsw_config.h`, and `faiss_hnsw.cc`: expose MPMI and the static layout choice through the standard HNSW-SQ build path, preserve original IDs during search and filtering, and serialize the mapping used by Milvus-facing calls.
 - `tests/rvanns/test_mpmi_cq1.cpp`: runs S=Scalar+FP32, V=SIMD+FP32, M=SIMD+MPMI, and F=MPMI+ROrder while reporting the effective backend, quantizer, layout, and RVV LMUL settings.
-- The correctness tests under `tests/rvanns/`: check MPMI numerical agreement, low-level graph-layout contracts, and the normal HNSW-SQ build/search/filter/serialization path.
+- The correctness tests under `tests/rvanns/` check MPMI numerical agreement, low-level graph-layout contracts, and the standard HNSW-SQ build, search, filtering, and serialization path.
 - `patches/mpmi.patch`: records the MPMI source delta separately from the complete artifact patch delivered with the release.
 - `scripts/`, `ci/`, `CMakeLists.txt`, and `conanfile.py`: provide dependency installation, build, coverage, and CI entry points used by the artifact.
 
@@ -30,17 +30,19 @@ The paper-facing standalone programs cover:
 Each graph layout is a one-shot post-build choice. The direct-Faiss experiment
 drivers cache the unordered index, reapply the selected layout after loading,
 and use `perm[new_id]=old_id` to return results to the original ID space because
-the added mapping is not part of upstream Faiss serialization. The normal
-HNSW-SQ `Build` path instead stores that mapping in its existing index
-wrapper header, so a serialized ROrder index preserves Milvus-visible IDs and
-bitset semantics after loading. Both paths reject adding vectors after layout;
-rebuild from the pre-layout data when the graph must be extended. The normal
-HNSW-SQ hook is deliberately limited to one non-refined, non-partitioned
-HNSW-SQ index, matching the paper's static post-build evaluation path. Invoke
-the combined `Build` API for a non-`unordered` layout; a separate `Train` then
-`Add` sequence intentionally remains growable and does not trigger the pass.
-The existing `trace_visit` debugging output is rejected after layout because
-its records use Faiss-internal IDs rather than the persisted external-ID map.
+the added mapping is not part of upstream Faiss serialization. By contrast,
+the standard HNSW-SQ `Build` path stores the mapping in the existing index
+wrapper header, ensuring that a serialized ROrder index preserves
+Milvus-visible IDs and bitset semantics after loading. Neither path permits
+vectors to be added after a layout has been applied; rebuild from the
+pre-layout data when the graph must be extended. The HNSW-SQ integration hook
+is intentionally restricted to a single non-refined, non-partitioned HNSW-SQ
+index, consistent with the paper's static post-build evaluation design. Use
+the combined `Build` API to select a non-`unordered` layout. A separate `Train`
+followed by `Add` intentionally leaves the index growable and therefore does
+not trigger the layout pass. The existing `trace_visit` debugging output is
+unavailable after layout because its records use Faiss-internal IDs rather
+than the persisted external-ID mapping.
 
 The regular unit tests are built when `with_ut=True`/`WITH_UT=ON` is enabled and run through the generated unit-test binary under `tests/ut/`. Faiss tests can be enabled with `with_faiss_tests=True`/`WITH_FAISS_TESTS=ON`. The Python tests live under `tests/python/`, and CI/E2E coverage is described by the Jenkins/Groovy files under `ci/`.
 
@@ -112,13 +114,13 @@ $ conan build ..
 $ ctest --output-on-failure -R '^river_'
 ```
 
-The four registered tests are self-contained: `river_mpmi_correctness`
-validates the compact row format and selected distance backend;
-the HNSW-SQ integration test validates the normal build, original-ID
-filtering, and serialization round trip; `river_hnsw_layout_contract` validates
-all six low-level layout paths; and `river_hnsw_layout_singleton` covers the
-one-node GOrder/ROrder edge case. The dataset-driven S/V/M/F program is built as `test_mpmi_cq1`; run
-`test_mpmi_cq1 --help` for its arguments.
+The four registered tests are self-contained. `river_mpmi_correctness`
+validates the compact row format and selected distance backend. The HNSW-SQ
+integration test covers the standard build path, original-ID filtering, and a
+serialization round trip. `river_hnsw_layout_contract` validates all six
+low-level layout paths, while `river_hnsw_layout_singleton` covers the one-node
+GOrder/ROrder edge case. The dataset-driven S/V/M/F program is built as
+`test_mpmi_cq1`; run `test_mpmi_cq1 --help` for its arguments.
 
 On a RISC-V build, CMake applies
 `-march=rv64gcv_zvfhmin -mabi=lp64d`; the Release configuration adds `-O3`.
