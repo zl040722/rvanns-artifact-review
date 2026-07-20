@@ -2,7 +2,7 @@ This document helps reviewers build the artifact from source code, understand it
 
 ## Introduction
 
-This artifact supports approximate nearest-neighbor search experiments for the RIVER paper. It implements MPMI as a common compact scalar-quantizer representation, provides an RVV-specialized tile-wise recovery and distance path, and implements ROrder as a post-build HNSW layout pass. The regular Knowhere HNSW-SQ build path accepts `sq_type=mpmi` and `graph_layout=rorder`; standalone programs additionally exercise the paper-facing S/V/M/F configurations, numerical agreement, and graph-layout baselines.
+This artifact supports approximate nearest-neighbor search experiments for the RIVER paper. It implements MPMI as a common compact scalar-quantizer representation, provides an RVV-specialized tile-wise recovery and distance path, and implements ROrder as a post-build HNSW layout pass. The regular HNSW-SQ build path accepts `sq_type=mpmi` and `graph_layout=rorder`; standalone programs additionally exercise the paper-facing S/V/M/F configurations, numerical agreement, and graph-layout baselines.
 
 ## Artifact Notes
 
@@ -13,9 +13,9 @@ The main artifact-related files are:
 - `thirdparty/faiss/faiss/impl/ScalarQuantizer.h`, `ScalarQuantizer.cpp`, and `IndexScalarQuantizer.cpp`: define the MPMI type, offline residual selection, compact row format, and dynamic code size.
 - `thirdparty/faiss/faiss/impl/ScalarQuantizerCodec_rvv.h` and `ScalarQuantizerDC_rvv.cpp`: widen the dense base and packed FP16 residuals within each recovery tile before RVV distance accumulation. Other CPU backends use the common MPMI representation with the existing dispatched FP32 distance primitive.
 - `thirdparty/faiss/faiss/IndexHNSW.h` and `IndexHNSW.cpp`: keep `perm[new_id]=old_id` and support unordered, BFS, RCM, RabbitOrder, GOrder-only, and full ROrder layouts. ROrder uses the same static topology-derived global permutation as GOrder and additionally normalizes level-0 adjacency order.
-- `src/index/refine/refine_utils.cc`, `src/index/hnsw/faiss_hnsw_config.h`, and `faiss_hnsw.cc`: expose MPMI and the static layout choice through the normal Knowhere HNSW-SQ build path, preserve original IDs for search and filtering, and serialize the mapping used by Milvus-facing calls.
+- `src/index/refine/refine_utils.cc`, `src/index/hnsw/faiss_hnsw_config.h`, and `faiss_hnsw.cc`: expose MPMI and the static layout choice through the normal HNSW-SQ build path, preserve original IDs for search and filtering, and serialize the mapping used by Milvus-facing calls.
 - `tests/rvanns/test_mpmi_cq1.cpp`: runs S=Scalar+FP32, V=SIMD+FP32, M=SIMD+MPMI, and F=MPMI+ROrder while reporting the effective backend, quantizer, layout, and RVV LMUL settings.
-- `tests/rvanns/test_mpmi_correctness.cpp`, `test_hnsw_reorder_micro.cpp`, and `test_knowhere_mpmi_rorder.cpp`: check MPMI numerical agreement, low-level graph-layout contracts, and the normal Knowhere build/search/filter/serialization path.
+- The correctness tests under `tests/rvanns/`: check MPMI numerical agreement, low-level graph-layout contracts, and the normal HNSW-SQ build/search/filter/serialization path.
 - `patches/mpmi.patch`: records the MPMI source delta separately from the complete artifact patch delivered with the release.
 - `scripts/`, `ci/`, `CMakeLists.txt`, and `conanfile.py`: provide dependency installation, build, coverage, and CI entry points used by the artifact.
 
@@ -31,11 +31,11 @@ Each graph layout is a one-shot post-build choice. The direct-Faiss experiment
 drivers cache the unordered index, reapply the selected layout after loading,
 and use `perm[new_id]=old_id` to return results to the original ID space because
 the added mapping is not part of upstream Faiss serialization. The normal
-Knowhere HNSW-SQ `Build` path instead stores that mapping in its existing index
+HNSW-SQ `Build` path instead stores that mapping in its existing index
 wrapper header, so a serialized ROrder index preserves Milvus-visible IDs and
 bitset semantics after loading. Both paths reject adding vectors after layout;
 rebuild from the pre-layout data when the graph must be extended. The normal
-Knowhere hook is deliberately limited to one non-refined, non-partitioned
+HNSW-SQ hook is deliberately limited to one non-refined, non-partitioned
 HNSW-SQ index, matching the paper's static post-build evaluation path. Invoke
 the combined `Build` API for a non-`unordered` layout; a separate `Train` then
 `Add` sequence intentionally remains growable and does not trigger the pass.
@@ -114,7 +114,7 @@ $ ctest --output-on-failure -R '^river_'
 
 The four registered tests are self-contained: `river_mpmi_correctness`
 validates the compact row format and selected distance backend;
-`river_knowhere_mpmi_rorder` validates the normal Knowhere build, original-ID
+the HNSW-SQ integration test validates the normal build, original-ID
 filtering, and serialization round trip; `river_hnsw_layout_contract` validates
 all six low-level layout paths; and `river_hnsw_layout_singleton` covers the
 one-node GOrder/ROrder edge case. The dataset-driven S/V/M/F program is built as `test_mpmi_cq1`; run
